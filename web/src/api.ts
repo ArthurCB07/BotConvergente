@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 export interface Snapshot {
   now: string;
+  persistence: { enabled: boolean; path: string | null };
   mode: 'OBSERVE' | 'SEMI_AUTO' | 'AUTO';
   automationPaused: boolean;
   account: any;
@@ -84,6 +85,15 @@ export const api = {
     request<{ ok: boolean; message: string }>(`/api/opportunities/${id}/confirm`, { method: 'POST' }),
   reject: (id: string) => request(`/api/opportunities/${id}/reject`, { method: 'POST' }),
   closePosition: (id: string) => request(`/api/positions/${id}/close`, { method: 'POST' }),
+  db: () =>
+    request<{ enabled: boolean; path?: string; schemaVersion?: number; counts?: Record<string, number> }>(
+      '/api/db',
+    ),
+  resetDb: () =>
+    request<{ ok: boolean }>('/api/db/reset', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: 'APAGAR' }),
+    }),
   runScenario: (key: string) =>
     request<{ ok: boolean; expected: string }>(`/api/scenarios/${key}`, { method: 'POST' }),
 };

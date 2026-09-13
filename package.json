@@ -8,7 +8,8 @@
     "dev:server": "npm -w server run dev",
     "dev:web": "npm -w web run dev",
     "test": "npm -w server run test",
-    "build": "npm -w web run build"
+    "build": "npm -w web run build",
+    "db:reset": "node -e \"const{rmSync}=require('node:fs');for(const f of ['server/data/app.db','server/data/app.db-wal','server/data/app.db-shm'])rmSync(f,{force:true});console.log('Banco apagado. O proximo start semeia o ambiente de demonstracao.')\""
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

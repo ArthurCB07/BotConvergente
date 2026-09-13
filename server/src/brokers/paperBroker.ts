@@ -34,6 +34,13 @@ class SeededRandom {
   constructor(seed: number) {
     this.state = seed >>> 0 || 1;
   }
+  /** Exposto para que o passeio aleatorio continue de onde parou apos reiniciar. */
+  getState(): number {
+    return this.state;
+  }
+  setState(state: number): void {
+    this.state = state >>> 0 || 1;
+  }
   next(): number {
     // xorshift32
     let x = this.state;
@@ -61,7 +68,17 @@ export interface PaperBrokerOptions {
   clock: Clock;
   initialBalance?: number;
   seed?: number;
+  onPositionOpened?: (position: Position) => void;
   onPositionClosed?: (position: Position) => void;
+}
+
+/** Estado do simulador que precisa sobreviver a um reinicio do processo. */
+export interface PaperBrokerState {
+  balance: number;
+  rngState: number;
+  prices: Array<{ symbol: string; mid: number; at: string }>;
+  positions: Position[];
+  orders: Array<{ clientOrderId: string; result: PlaceOrderResult }>;
 }
 
 export class PaperBroker implements BrokerAdapter {
@@ -73,6 +90,7 @@ export class PaperBroker implements BrokerAdapter {
   private ordersByClientId = new Map<string, PlaceOrderResult>();
   private connected = false;
   private balance: number;
+  private onPositionOpened?: (position: Position) => void;
   private onPositionClosed?: (position: Position) => void;
 
   /** Injecao de falha para os cenarios de demonstracao. */
@@ -86,6 +104,7 @@ export class PaperBroker implements BrokerAdapter {
     this.clock = options.clock;
     this.rng = new SeededRandom(options.seed ?? 20260913);
     this.balance = options.initialBalance ?? 10_000;
+    this.onPositionOpened = options.onPositionOpened;
     this.onPositionClosed = options.onPositionClosed;
     for (const instrument of INSTRUMENTS) {
       this.prices.set(instrument.symbol, {
@@ -213,6 +232,58 @@ export class PaperBroker implements BrokerAdapter {
     this.balance += amount;
   }
 
+  // --- Persistencia ---------------------------------------------------------
+
+  serialize(): PaperBrokerState {
+    return {
+      balance: this.balance,
+      rngState: this.rng.getState(),
+      prices: [...this.prices.values()].map((p) => ({
+        symbol: p.instrument.symbol,
+        mid: p.mid,
+        at: p.at,
+      })),
+      positions: this.positions.map((p) => ({ ...p })),
+      orders: [...this.ordersByClientId.entries()].map(([clientOrderId, result]) => ({
+        clientOrderId,
+        result,
+      })),
+    };
+  }
+
+  /**
+   * Recarrega o estado salvo. Nao dispara `onPositionClosed`: as posicoes ja
+   * fechadas antes do reinicio ja foram contabilizadas no dia em que fecharam.
+   */
+  /** Volta ao estado inicial. Usado pelo reinicio do ambiente de demonstracao. */
+  reset(balance: number, seed: number): void {
+    this.balance = balance;
+    this.rng.setState(seed);
+    this.positions = [];
+    this.ordersByClientId = new Map();
+    this.failureMode = 'NONE';
+    this.freezeQuotes = false;
+    this.spreadMultiplier = 1;
+    for (const state of this.prices.values()) {
+      state.mid = state.instrument.referencePrice;
+      state.at = this.clock.nowIso();
+    }
+  }
+
+  restore(state: PaperBrokerState): void {
+    this.balance = state.balance;
+    this.rng.setState(state.rngState);
+    for (const price of state.prices) {
+      const current = this.prices.get(price.symbol);
+      if (current) {
+        current.mid = price.mid;
+        current.at = price.at;
+      }
+    }
+    this.positions = state.positions.map((p) => ({ ...p }));
+    this.ordersByClientId = new Map(state.orders.map((o) => [o.clientOrderId, o.result]));
+  }
+
   // --- Ordens ---------------------------------------------------------------
 
   async placeOrder(req: PlaceOrderRequest): Promise<PlaceOrderResult> {
@@ -307,6 +378,7 @@ export class PaperBroker implements BrokerAdapter {
     };
     position.netPnl = -position.costs;
     this.positions.push(position);
+    this.onPositionOpened?.({ ...position });
 
     return {
       status: 'FILLED',

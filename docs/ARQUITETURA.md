@@ -130,9 +130,54 @@ REST para comandos e leitura de estado; `GET /api/stream` (SSE) para avisar a in
 estado mudou — a interface então recarrega o instantâneo. Simples de entender e suficiente para o
 protótipo; substituível por WebSocket com diffs quando o volume justificar.
 
+## Persistência
+
+SQLite pelo módulo nativo `node:sqlite` — sem dependência para compilar, o que evita exigir
+ferramentas de build no Windows. Arquivo padrão: `server/data/app.db`, ancorado no próprio módulo
+para que `npm run dev` na raiz e `npm start` dentro de `server/` abram o mesmo banco. `DB_PATH`
+sobrescreve.
+
+**Formato das tabelas.** Colunas indexáveis para o que se consulta — data, situação, instrumento,
+chave de cliente — mais uma coluna `data` com o registro completo em JSON. É um meio termo
+deliberado: o modelo de domínio evolui sem migração a cada campo novo, e relatórios por SQL
+continuam possíveis. O esquema tem versão; um banco mais novo que o código é recusado na abertura
+em vez de ser lido pela metade.
+
+**O que é gravado por linha:** fontes, sinais, oportunidades, ordens, posições e eventos de
+auditoria — no momento da mudança.
+
+**O que é gravado em chave e valor:** modo operacional, pausa da automação, configurações de
+convergência e de risco, estado do dia e estado do simulador (saldo, posições abertas, mapa de
+chaves de cliente, preços e semente do passeio aleatório). Essas gravações são agrupadas e
+limitadas a uma a cada 5 segundos, com gravação forçada em toda mudança de controle, execução de
+ordem, fechamento de posição e no encerramento do processo.
+
+**Na volta.** `Engine.hydrate()` carrega tudo. Duas garantias importantes:
+
+1. Oportunidade que venceu enquanto o processo estava fora do ar volta como `EXPIRED`, nunca
+   elegível — o preço andou sem supervisão.
+2. O mapa de chaves de cliente do simulador volta junto, então a idempotência de ordem atravessa o
+   reinício: uma ordem já executada continua sendo reconhecida como já executada.
+
+Banco vazio faz o servidor semear o ambiente de demonstração. `POST /api/db/reset` (com
+`{"confirm":"APAGAR"}`) apaga tudo e semeia de novo; a interface pede confirmação em dois passos.
+Eventos e sinais têm retenção de 5.000 registros, aplicada na entrada e na saída do processo.
+
+## Tema da interface
+
+Três estados: claro, escuro e sistema. Escolha explícita marca `data-theme` na raiz e vence a
+media query nos dois sentidos; "sistema" não marca nada e deixa `prefers-color-scheme` decidir. A
+preferência fica em `localStorage`, com leitura protegida por `try/catch` — navegador anônimo ou
+armazenamento bloqueado cai no padrão. Um script mínimo no `index.html` aplica o tema antes da
+primeira pintura, para a página não piscar clara.
+
+Toda cor sai de token. Texto sobre fundo sólido usa `--on-ink` e `--on-accent`, que invertem junto
+com o tema; bordas de distintivo derivam da própria cor do estado por `color-mix`, em vez de lista
+fixa. A gramática de cor é a mesma nos dois temas: estado de decisão primeiro, direção em azul e
+laranja, verde e vermelho só para dinheiro.
+
 ## Limitações conhecidas do protótipo
 
-- Estado em memória. Reiniciar o backend zera tudo.
 - Sem autenticação nem multiusuário.
 - Preço simulado não reproduz liquidez, gaps de notícia nem rejeições reais.
 - Conectores de Telegram, Discord e APIs de terceiros existem apenas como tipo de cadastro.

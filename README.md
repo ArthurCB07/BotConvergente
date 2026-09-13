@@ -35,6 +35,8 @@ npm run dev
 - Backend: http://localhost:8787
 - Interface: http://localhost:5173
 
+O estado fica gravado em `server/data/app.db` (SQLite). Reiniciar o backend retoma de onde parou.
+
 Outros comandos:
 
 ```bash
@@ -45,6 +47,14 @@ npm test
 npm -w server run typecheck
 ```
 
+Apagar o banco e recomeçar do ambiente de demonstração:
+
+```bash
+npm run db:reset
+```
+
+Para usar outro arquivo de banco, defina `DB_PATH` antes de subir o backend.
+
 ## Telas
 
 | Tela | O que resolve |
@@ -54,7 +64,10 @@ npm -w server run typecheck
 | Convergências | Todos os agrupamentos avaliados agora, inclusive os que **não** passaram — com o motivo |
 | Operações | Ordens, posições, histórico com bruto/custos/líquido, registro completo de decisões |
 | Corretoras | Conta ativa e comparativo das integrações, com o que falta para habilitar cada uma |
-| Configurações | Todo parâmetro com sugestão, explicação, efeito, dependências e botão de restaurar |
+| Configurações | Todo parâmetro com sugestão, explicação, efeito, dependências e botão de restaurar; estado do banco e reinício do ambiente |
+
+A interface tem tema claro, escuro e "sistema". A escolha fica no navegador do usuário — não vai
+para o backend nem para o banco.
 
 ## Arquitetura
 
@@ -67,6 +80,7 @@ server/src/core/        núcleo puro, sem I/O — testável isoladamente
   risk.ts               portões de risco e dimensionamento
   settings.ts           padrões e descritores de cada parâmetro
 server/src/brokers/     contrato de corretora + simulador + catálogo de integrações
+server/src/infra/       persistência em SQLite (node:sqlite, sem dependência nativa)
 server/src/sources/     gerador de sinais do protótipo
 server/src/engine/      orquestrador: ingestão → convergência → risco → execução → registro
 server/src/http.ts      API REST + fluxo de eventos (SSE)

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type Meta, type Snapshot } from '../api.ts';
 import { Badge, Card, Empty } from '../components/ui.tsx';
 
@@ -249,6 +249,8 @@ export function Configuracoes({ snapshot, meta }: { snapshot: Snapshot; meta: Me
         )}
       </Card>
 
+      <Persistencia snapshot={snapshot} />
+
       <Card title="Caixa da conta simulada">
         <p className="small muted">
           Depositos e saques entram no saldo e ficam de fora do resultado operacional do dia.
@@ -263,6 +265,104 @@ export function Configuracoes({ snapshot, meta }: { snapshot: Snapshot; meta: Me
         </div>
       </Card>
     </div>
+  );
+}
+
+const TABLE_LABEL: Record<string, string> = {
+  sources: 'fontes',
+  signals: 'sinais',
+  opportunities: 'oportunidades',
+  orders: 'ordens',
+  positions: 'posicoes',
+  events: 'eventos',
+};
+
+function Persistencia({ snapshot }: { snapshot: Snapshot }) {
+  const [info, setInfo] = useState<Awaited<ReturnType<typeof api.db>> | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  // Recarrega a contagem quando o instantaneo muda de minuto.
+  useEffect(() => {
+    void api.db().then(setInfo).catch(() => setInfo(null));
+  }, [snapshot.now.slice(0, 16)]);
+
+  if (!snapshot.persistence.enabled) {
+    return (
+      <Card title="Persistencia">
+        <p className="small muted">
+          Este backend esta rodando sem banco. O estado vive apenas em memoria e some ao reiniciar.
+        </p>
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      title="Persistencia"
+      aside={<Badge tone="ok">SQLite</Badge>}
+    >
+      <p className="small muted">
+        Fontes, sinais, oportunidades, ordens, posicoes, eventos e configuracoes ficam gravados em
+        disco. Reiniciar o backend retoma de onde parou. Oportunidades que venceram enquanto o
+        processo estava fora do ar voltam como expiradas, nunca elegiveis.
+      </p>
+
+      <dl className="param-note small" style={{ marginTop: 10 }}>
+        <dt>Arquivo</dt>
+        <dd className="num">{snapshot.persistence.path}</dd>
+        <dt>Esquema</dt>
+        <dd className="num">versao {info?.schemaVersion ?? '—'}</dd>
+        <dt>Registros</dt>
+        <dd className="num">
+          {info?.counts
+            ? Object.entries(info.counts)
+                .map(([table, n]) => `${n} ${TABLE_LABEL[table] ?? table}`)
+                .join(' · ')
+            : '—'}
+        </dd>
+      </dl>
+
+      <div className="notice notice-risk small" style={{ marginTop: 12 }}>
+        <strong>Apagar o banco e irreversivel.</strong> Remove todo o historico de decisoes,
+        operacoes e ajustes, e devolve as configuracoes aos valores sugeridos.
+      </div>
+
+      <div className="row" style={{ marginTop: 10 }}>
+        {confirming ? (
+          <>
+            <button
+              className="btn btn-danger btn-sm"
+              onClick={async () => {
+                try {
+                  await api.resetDb();
+                  setNote('Banco apagado. Ambiente de demonstracao semeado de novo.');
+                } catch (e) {
+                  setNote((e as Error).message);
+                } finally {
+                  setConfirming(false);
+                  void api.db().then(setInfo).catch(() => undefined);
+                }
+              }}
+            >
+              Confirmar: apagar tudo
+            </button>
+            <button className="btn btn-sm" onClick={() => setConfirming(false)}>
+              Cancelar
+            </button>
+          </>
+        ) : (
+          <button className="btn btn-sm" onClick={() => setConfirming(true)}>
+            Apagar banco e recomecar
+          </button>
+        )}
+      </div>
+      {note && (
+        <div className="notice small" style={{ marginTop: 10 }}>
+          {note}
+        </div>
+      )}
+    </Card>
   );
 }
 

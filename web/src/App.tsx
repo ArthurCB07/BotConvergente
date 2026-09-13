@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api, useMeta, useSnapshot } from './api.ts';
 import { Badge, MODE_LABEL, clock, relative, signed } from './components/ui.tsx';
+import { ThemeToggle } from './components/ThemeToggle.tsx';
 import { Home } from './pages/Home.tsx';
 import { Fontes } from './pages/Fontes.tsx';
 import { Convergencias } from './pages/Convergencias.tsx';
@@ -71,6 +72,7 @@ export default function App() {
         </nav>
 
         <div className="stack-sm" style={{ marginTop: 'auto' }}>
+          <ThemeToggle />
           <div className="eyebrow">Modo operacional</div>
           <div className="seg" role="group" aria-label="Modo operacional">
             {(['OBSERVE', 'SEMI_AUTO', 'AUTO'] as const).map((m) => (

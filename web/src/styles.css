@@ -40,6 +40,13 @@
   --gain: #157f4d;
   --loss: #b3261e;
 
+  /* Texto sobre fundos solidos. Inverte junto com o tema. */
+  --on-ink: #ffffff;
+  --on-accent: #ffffff;
+  --row-hover: #fbfbf9;
+  --hatch: #e6e6e0;
+  --hatch-border: #b4b8ae;
+
   --radius: 4px;
   --radius-lg: 6px;
   --rail: 212px;
@@ -48,6 +55,91 @@
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 
   color-scheme: light;
+}
+
+/*
+ * Tema escuro.
+ *
+ * Tres estados: o usuario escolhe claro, escolhe escuro, ou deixa no sistema.
+ * A escolha explicita marca `data-theme` na raiz; "sistema" nao marca nada e a
+ * media query decide. Por isso o bloco de sistema e protegido contra o caso de o
+ * usuario ter pedido claro dentro de um sistema escuro.
+ *
+ * O tema escuro mantem a mesma gramatica de cor do claro: estado de decisao
+ * primeiro, direcao em azul e laranja, verde e vermelho so para dinheiro.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #131519;
+    --surface: #1a1d23;
+    --surface-sunken: #22262d;
+    --ink: #e7e9e6;
+    --ink-2: #a6adb8;
+    --ink-3: #757d89;
+    --line: #2a2e36;
+    --line-strong: #3c414b;
+
+    --ok: #55b9a8;
+    --ok-bg: #12302c;
+    --block: #dd9448;
+    --block-bg: #352514;
+    --watch: #9a97e8;
+    --watch-bg: #242243;
+    --risk: #e37a90;
+    --risk-bg: #3b1b23;
+
+    --long: #74abe4;
+    --long-bg: #152836;
+    --short: #e29a68;
+    --short-bg: #34251a;
+
+    --gain: #5bc188;
+    --loss: #e8776c;
+
+    --on-ink: #14161a;
+    --on-accent: #14161a;
+    --row-hover: #1f232a;
+    --hatch: #2b2f37;
+    --hatch-border: #4a5059;
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --paper: #131519;
+  --surface: #1a1d23;
+  --surface-sunken: #22262d;
+  --ink: #e7e9e6;
+  --ink-2: #a6adb8;
+  --ink-3: #757d89;
+  --line: #2a2e36;
+  --line-strong: #3c414b;
+
+  --ok: #55b9a8;
+  --ok-bg: #12302c;
+  --block: #dd9448;
+  --block-bg: #352514;
+  --watch: #9a97e8;
+  --watch-bg: #242243;
+  --risk: #e37a90;
+  --risk-bg: #3b1b23;
+
+  --long: #74abe4;
+  --long-bg: #152836;
+  --short: #e29a68;
+  --short-bg: #34251a;
+
+  --gain: #5bc188;
+  --loss: #e8776c;
+
+  --on-ink: #14161a;
+  --on-accent: #14161a;
+  --row-hover: #1f232a;
+  --hatch: #2b2f37;
+  --hatch-border: #4a5059;
+
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -156,9 +248,9 @@ p:last-child { margin-bottom: 0; }
 .nav-item:hover { background: var(--surface-sunken); color: var(--ink); }
 .nav-item[aria-current='true'] {
   background: var(--ink);
-  color: #fff;
+  color: var(--on-ink);
 }
-.nav-item[aria-current='true'] .nav-count { color: rgba(255, 255, 255, 0.65); }
+.nav-item[aria-current='true'] .nav-count { color: color-mix(in srgb, var(--on-ink) 60%, transparent); }
 .nav-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
 
 .main { min-width: 0; display: flex; flex-direction: column; }
@@ -242,13 +334,21 @@ p:last-child { margin-bottom: 0; }
   border: 1px solid transparent;
   white-space: nowrap;
 }
-.badge-ok { background: var(--ok-bg); color: var(--ok); border-color: #c7e3df; }
-.badge-block { background: var(--block-bg); color: var(--block); border-color: #f0d8bb; }
-.badge-watch { background: var(--watch-bg); color: var(--watch); border-color: #d3d1ee; }
-.badge-risk { background: var(--risk-bg); color: var(--risk); border-color: #f2ccd4; }
+/* A borda deriva da propria cor do estado, entao acompanha o tema sem lista fixa. */
+.badge-ok,
+.badge-block,
+.badge-watch,
+.badge-risk,
+.badge-long,
+.badge-short { border-color: color-mix(in srgb, currentColor 30%, transparent); }
+
+.badge-ok { background: var(--ok-bg); color: var(--ok); }
+.badge-block { background: var(--block-bg); color: var(--block); }
+.badge-watch { background: var(--watch-bg); color: var(--watch); }
+.badge-risk { background: var(--risk-bg); color: var(--risk); }
 .badge-neutral { background: var(--surface-sunken); color: var(--ink-2); border-color: var(--line); }
-.badge-long { background: var(--long-bg); color: var(--long); border-color: #cfe0f0; }
-.badge-short { background: var(--short-bg); color: var(--short); border-color: #f2ddca; }
+.badge-long { background: var(--long-bg); color: var(--long); }
+.badge-short { background: var(--short-bg); color: var(--short); }
 
 .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
 
@@ -277,16 +377,16 @@ p:last-child { margin-bottom: 0; }
   min-width: 0;
   cursor: default;
 }
-.quorum-agree { background: var(--ok); color: #fff; }
-.quorum-dissent { background: var(--risk); color: #fff; }
+.quorum-agree { background: var(--ok); color: var(--on-accent); }
+.quorum-dissent { background: var(--risk); color: var(--on-accent); }
 .quorum-incomparable {
-  background: repeating-linear-gradient(135deg, var(--surface-sunken), var(--surface-sunken) 4px, #e6e6e0 4px, #e6e6e0 8px);
+  background: repeating-linear-gradient(135deg, var(--surface-sunken), var(--surface-sunken) 4px, var(--hatch) 4px, var(--hatch) 8px);
   color: var(--ink-2);
   border: 1px solid var(--line-strong);
 }
 .quorum-absent {
   background: var(--surface-sunken);
-  border: 1px dashed #b4b8ae;
+  border: 1px dashed var(--hatch-border);
   color: var(--ink-3);
 }
 .quorum-legend { display: flex; flex-wrap: wrap; gap: 12px; }
@@ -330,7 +430,7 @@ th {
 }
 td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 tbody tr:last-child td { border-bottom: 0; }
-tbody tr:hover { background: #fbfbf9; }
+tbody tr:hover { background: var(--row-hover); }
 td.num, th.num { text-align: right; }
 
 /* --- Controles ------------------------------------------------------------ */
@@ -350,10 +450,10 @@ td.num, th.num { text-align: right; }
 .btn:hover { background: var(--surface-sunken); }
 .btn:focus-visible { outline: 2px solid var(--watch); outline-offset: 1px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.btn-primary { background: var(--ink); color: #fff; border-color: var(--ink); }
-.btn-primary:hover { background: #2a2f38; }
-.btn-danger { background: var(--risk); color: #fff; border-color: var(--risk); }
-.btn-danger:hover { background: #932339; }
+.btn-primary { background: var(--ink); color: var(--on-ink); border-color: var(--ink); }
+.btn-primary:hover { background: color-mix(in srgb, var(--ink) 85%, var(--ink-2)); }
+.btn-danger { background: var(--risk); color: var(--on-accent); border-color: var(--risk); }
+.btn-danger:hover { background: color-mix(in srgb, var(--risk) 82%, var(--ink)); }
 .btn-sm { padding: 3px 8px; font-size: 12px; }
 
 .seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: var(--radius); overflow: hidden; }
@@ -367,7 +467,7 @@ td.num, th.num { text-align: right; }
   color: var(--ink-2);
 }
 .seg button:last-child { border-right: 0; }
-.seg button[aria-pressed='true'] { background: var(--ink); color: #fff; }
+.seg button[aria-pressed='true'] { background: var(--ink); color: var(--on-ink); }
 
 input[type='text'], input[type='number'], select, textarea {
   width: 100%;
@@ -452,7 +552,7 @@ label { display: block; }
 
 .sim-banner {
   background: var(--watch);
-  color: #fff;
+  color: var(--on-accent);
   padding: 5px 22px;
   font-family: var(--font-mono);
   font-size: 11px;

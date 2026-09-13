@@ -1,5 +1,6 @@
-import { PaperBroker } from '../brokers/paperBroker.ts';
+import { PaperBroker, type PaperBrokerState } from '../brokers/paperBroker.ts';
 import { brokerCatalog } from '../brokers/registry.ts';
+import type { Store } from '../infra/store.ts';
 import { clusterKeyOf, evaluateConvergence, type ConvergenceEvaluation } from '../core/convergence.ts';
 import { clientOrderIdFor, id } from '../core/ids.ts';
 import { ingest, refreshSignalStatus, type SignalInput } from '../core/ingestion.ts';
@@ -40,7 +41,22 @@ export interface EngineOptions {
   clock?: Clock;
   seed?: number;
   initialBalance?: number;
+  /** Quando ausente, o motor roda apenas em memoria. */
+  store?: Store;
 }
+
+/** Chaves do armazenamento de estado avulso. */
+const KV = {
+  mode: 'runtime.mode',
+  paused: 'runtime.automationPaused',
+  convergence: 'settings.convergence',
+  risk: 'settings.risk',
+  day: 'runtime.day',
+  broker: 'broker.paper.state',
+} as const;
+
+/** Intervalo minimo entre gravacoes do estado do simulador. */
+const RUNTIME_PERSIST_INTERVAL_MS = 5_000;
 
 export class Engine {
   readonly clock: Clock;
@@ -73,12 +89,21 @@ export class Engine {
   /** Execucoes assincronas pendentes, para que os cenarios e testes possam aguardar. */
   private pending: Array<Promise<unknown>> = [];
 
+  readonly store: Store | null;
+  private lastRuntimePersistAt = 0;
+  private readonly initialBalance: number;
+  private readonly seed: number;
+
   constructor(options: EngineOptions = {}) {
     this.clock = options.clock ?? systemClock;
+    this.store = options.store ?? null;
+    this.initialBalance = options.initialBalance ?? 10_000;
+    this.seed = options.seed ?? 20260913;
     this.broker = new PaperBroker({
       clock: this.clock,
-      seed: options.seed,
-      initialBalance: options.initialBalance ?? 10_000,
+      seed: this.seed,
+      initialBalance: this.initialBalance,
+      onPositionOpened: (position) => this.store?.savePosition(position),
       onPositionClosed: (position) => this.handlePositionClosed(position),
     });
     this.day = {
@@ -126,8 +151,134 @@ export class Engine {
     };
     this.events.unshift(event);
     if (this.events.length > 800) this.events.length = 800;
+    this.store?.saveEvent(event);
     this.emit('event', event);
     return event;
+  }
+
+  // --- Persistencia ----------------------------------------------------------
+
+  /**
+   * Carrega o estado salvo. Devolve `false` quando o banco esta vazio, para que o
+   * chamador saiba que precisa semear o ambiente de demonstracao.
+   */
+  hydrate(): boolean {
+    if (!this.store) return false;
+    const sources = this.store.loadSources();
+    if (sources.length === 0) return false;
+
+    this.sources = sources;
+    this.signals = this.store.loadSignals();
+    this.opportunities = this.store.loadOpportunities();
+    this.orders = this.store.loadOrders();
+    this.events = this.store.loadEvents();
+
+    const mode = this.store.get<OperationMode>(KV.mode);
+    if (mode) this.mode = mode;
+    const paused = this.store.get<boolean>(KV.paused);
+    if (typeof paused === 'boolean') this.automationPaused = paused;
+    const convergence = this.store.get<ConvergenceSettings>(KV.convergence);
+    if (convergence) this.convergenceSettings = { ...this.convergenceSettings, ...convergence };
+    const risk = this.store.get<RiskSettings>(KV.risk);
+    if (risk) this.riskSettings = { ...this.riskSettings, ...risk };
+    const day = this.store.get<DayState>(KV.day);
+    if (day) this.day = day;
+    const brokerState = this.store.get<PaperBrokerState>(KV.broker);
+    if (brokerState) this.broker.restore(brokerState);
+
+    /*
+     * Uma oportunidade que ficou publicada enquanto o processo estava fora do ar
+     * nao pode voltar elegivel: o preco andou sem supervisao. Expira tudo que
+     * passou da validade antes de qualquer avaliacao.
+     */
+    const now = this.clock.nowIso();
+    for (const opportunity of this.opportunities) {
+      const active = opportunity.status === 'PUBLISHED' || opportunity.status === 'UPDATED';
+      if (active && Date.parse(opportunity.validUntil) <= Date.parse(now)) {
+        opportunity.status = 'EXPIRED';
+        this.store.saveOpportunity(opportunity);
+      }
+    }
+
+    this.log(
+      'CONNECTION_RESTORED',
+      'INFO',
+      'Estado recuperado do banco',
+      `${sources.length} fonte(s), ${this.signals.length} sinal(is), ${this.opportunities.length} oportunidade(s) e ${this.orders.length} ordem(ns) carregadas de ${this.store.path}.`,
+    );
+    return true;
+  }
+
+  /** Grava o estado avulso. Limitado por tempo, exceto quando `force`. */
+  persistRuntime(force = false): void {
+    if (!this.store) return;
+    const elapsed = Date.now() - this.lastRuntimePersistAt;
+    if (!force && elapsed < RUNTIME_PERSIST_INTERVAL_MS) return;
+    this.lastRuntimePersistAt = Date.now();
+
+    const store = this.store;
+    store.transaction(() => {
+      store.put(KV.mode, this.mode);
+      store.put(KV.paused, this.automationPaused);
+      store.put(KV.convergence, this.convergenceSettings);
+      store.put(KV.risk, this.riskSettings);
+      store.put(KV.day, this.day);
+      store.put(KV.broker, this.broker.serialize());
+    });
+  }
+
+  /**
+   * Apaga tudo e recomeca. O semeador entra por parametro para o motor nao
+   * depender do modulo de demonstracao.
+   */
+  resetEnvironment(seeder?: (engine: Engine) => void): void {
+    this.store?.wipe();
+    this.sources = [];
+    this.signals = [];
+    this.opportunities = [];
+    this.orders = [];
+    this.events = [];
+    this.evaluations = [];
+    this.decisions.clear();
+    this.awaitingConfirmation.clear();
+    this.executing.clear();
+    this.pending = [];
+
+    this.mode = defaultMode;
+    this.automationPaused = false;
+    this.convergenceSettings = { ...defaultConvergenceSettings };
+    this.riskSettings = { ...defaultRiskSettings };
+    this.broker.reset(this.initialBalance, this.seed);
+    this.day = {
+      dayKey: tradingDayKey(this.clock.nowIso(), this.riskSettings.tradingTimezone),
+      baseEquity: this.initialBalance,
+      realizedNetPnl: 0,
+      costs: 0,
+      cashFlows: 0,
+      tradesToday: 0,
+      lastEntryAt: null,
+      consecutiveLosses: 0,
+      pausedUntil: null,
+      dailyLimitHit: null,
+    };
+
+    seeder?.(this);
+    this.log(
+      'SETTINGS_CHANGED',
+      'WARN',
+      'Ambiente reiniciado',
+      'Banco apagado e configuracoes de volta aos valores sugeridos. Acao irreversivel.',
+    );
+    this.persistRuntime(true);
+    this.runPipeline();
+  }
+
+  /** Chamado no encerramento do processo. */
+  shutdown(): void {
+    if (!this.store) return;
+    this.persistRuntime(true);
+    this.store.prune();
+    this.store.close();
   }
 
   private notifyState(): void {
@@ -152,6 +303,7 @@ export class Engine {
       stats: { received: 0, valid: 0, rejected: 0, lastSignalAt: null },
     };
     this.sources.push(source);
+    this.store?.saveSource(source);
     this.notifyState();
     return source;
   }
@@ -167,6 +319,7 @@ export class Engine {
       weight: patch.weight ?? source.weight,
       notes: patch.notes ?? source.notes,
     });
+    this.store?.saveSource(source);
     this.runPipeline();
     return source;
   }
@@ -175,6 +328,7 @@ export class Engine {
     const before = this.sources.length;
     this.sources = this.sources.filter((s) => s.id !== sourceId);
     if (this.sources.length === before) return false;
+    this.store?.deleteSource(sourceId);
     this.runPipeline();
     return true;
   }
@@ -217,6 +371,7 @@ export class Engine {
             ...target.issues,
             { code: 'CANCELADO', message: outcome.note, severity: 'BLOCK' },
           ];
+          this.store?.saveSignal(target);
         }
         this.log(
           'SIGNAL_CANCELLED',
@@ -231,6 +386,7 @@ export class Engine {
       case 'REJECTED': {
         source.stats.rejected += 1;
         this.signals.unshift(outcome.signal);
+        this.store?.saveSignal(outcome.signal);
         this.log(
           'SIGNAL_REJECTED',
           'BLOCK',
@@ -247,6 +403,7 @@ export class Engine {
           if (prior) {
             prior.status = 'SUPERSEDED';
             prior.supersededBySignalId = outcome.signal.id;
+            this.store?.saveSignal(prior);
           }
           this.log(
             'SIGNAL_SUPERSEDED',
@@ -257,6 +414,7 @@ export class Engine {
           );
         }
         this.signals.unshift(outcome.signal);
+        this.store?.saveSignal(outcome.signal);
         if (outcome.signal.status === 'VALID') source.stats.valid += 1;
         else source.stats.rejected += 1;
 
@@ -276,6 +434,7 @@ export class Engine {
     }
 
     if (this.signals.length > 500) this.signals.length = 500;
+    this.store?.saveSource(source);
     this.runPipeline();
     return result;
   }
@@ -308,6 +467,7 @@ export class Engine {
       if (active && Date.parse(opportunity.validUntil) <= Date.parse(now)) {
         opportunity.status = 'EXPIRED';
         this.awaitingConfirmation.delete(opportunity.id);
+        this.store?.saveOpportunity(opportunity);
         this.log(
           'OPPORTUNITY_EXPIRED',
           'WARN',
@@ -378,6 +538,7 @@ export class Engine {
         existing.participantCount !== evaluation.participantCount ||
         existing.referenceEntry !== evaluation.referenceEntry;
       Object.assign(existing, payload, { updatedAt: now });
+      this.store?.saveOpportunity(existing);
       if (changed) {
         existing.version += 1;
         if (existing.status !== 'EXECUTED') existing.status = 'UPDATED';
@@ -389,6 +550,7 @@ export class Engine {
           `Versao ${existing.version}: ${evaluation.agreeingCount} de ${evaluation.participantCount} fontes. Atualizacao nao gera entrada adicional (limite de ${this.riskSettings.maxExecutionsPerOpportunity} execucao por oportunidade).`,
           { opportunityId: existing.id },
         );
+        this.store?.saveOpportunity(existing);
       }
       return;
     }
@@ -406,6 +568,7 @@ export class Engine {
     };
     this.opportunities.unshift(opportunity);
     if (this.opportunities.length > 200) this.opportunities.length = 200;
+    this.store?.saveOpportunity(opportunity);
 
     this.log(
       'OPPORTUNITY_PUBLISHED',
@@ -491,6 +654,7 @@ export class Engine {
     if (!opportunity) return false;
     opportunity.status = 'REJECTED_BY_USER';
     this.awaitingConfirmation.delete(opportunityId);
+    this.store?.saveOpportunity(opportunity);
     this.log(
       'RISK_BLOCKED',
       'WARN',
@@ -564,6 +728,7 @@ export class Engine {
       simulated: true,
     };
     this.orders.unshift(order);
+    this.store?.saveOrder(order);
 
     this.log(
       'ORDER_SENT',
@@ -587,6 +752,7 @@ export class Engine {
       order.status = 'TIMEOUT';
       order.message = result.reason;
       order.updatedAt = this.clock.nowIso();
+      this.store?.saveOrder(order);
       this.log(
         'ORDER_TIMEOUT',
         'WARN',
@@ -598,6 +764,7 @@ export class Engine {
       if (reconciled && (reconciled.status === 'FILLED' || reconciled.status === 'DUPLICATE')) {
         result = reconciled;
         order.status = 'RECONCILED';
+        this.store?.saveOrder(order);
         this.log(
           'ORDER_RECONCILED',
           'SUCCESS',
@@ -615,6 +782,7 @@ export class Engine {
       order.status = 'REJECTED';
       order.message = result.reason;
       order.updatedAt = this.clock.nowIso();
+      this.store?.saveOrder(order);
       this.log('ORDER_REJECTED', 'BLOCK', `Ordem recusada em ${opportunity.symbol}`, result.reason, {
         opportunityId: opportunity.id,
         orderId: order.id,
@@ -634,6 +802,9 @@ export class Engine {
     this.awaitingConfirmation.delete(opportunity.id);
     this.day.tradesToday += 1;
     this.day.lastEntryAt = this.clock.nowIso();
+    this.store?.saveOrder(order);
+    this.store?.saveOpportunity(opportunity);
+    this.persistRuntime(true);
 
     this.log(
       'ORDER_FILLED',
@@ -650,6 +821,7 @@ export class Engine {
   // --- Ciclo de vida das posicoes -------------------------------------------
 
   private handlePositionClosed(position: Position): void {
+    this.store?.savePosition(position);
     this.day.realizedNetPnl = Math.round((this.day.realizedNetPnl + position.netPnl) * 100) / 100;
     this.day.costs = Math.round((this.day.costs + position.costs) * 100) / 100;
 
@@ -680,6 +852,7 @@ export class Engine {
     );
 
     this.checkDailyLimits();
+    this.persistRuntime(true);
   }
 
   private checkDailyLimits(): void {
@@ -743,6 +916,7 @@ export class Engine {
       dailyLimitHit: null,
     };
     this.log('MODE_CHANGED', 'INFO', 'Virada do dia operacional', `Novo dia ${key}. Base do dia redefinida para o patrimonio de abertura.`);
+    this.persistRuntime(true);
   }
 
   // --- Controles -------------------------------------------------------------
@@ -757,6 +931,7 @@ export class Engine {
       AUTO: 'Autonomo',
     };
     this.log('MODE_CHANGED', 'INFO', `Modo alterado para ${label[mode]}`, `Modo anterior: ${label[previous]}.`);
+    this.persistRuntime(true);
     this.runPipeline();
   }
 
@@ -770,6 +945,7 @@ export class Engine {
         ? 'Nenhuma ordem sera enviada ate a retomada. Posicoes abertas continuam com stop e alvo.'
         : 'Envio de ordens liberado conforme o modo operacional.',
     );
+    this.persistRuntime(true);
     this.runPipeline();
   }
 
@@ -782,6 +958,7 @@ export class Engine {
       'Configuracao de convergencia alterada',
       `Campos: ${changed.join(', ')}.`,
     );
+    this.persistRuntime(true);
     this.runPipeline();
   }
 
@@ -789,6 +966,7 @@ export class Engine {
     const changed = Object.keys(patch);
     this.riskSettings = { ...this.riskSettings, ...patch };
     this.log('SETTINGS_CHANGED', 'INFO', 'Configuracao de risco alterada', `Campos: ${changed.join(', ')}.`);
+    this.persistRuntime(true);
     this.runPipeline();
   }
 
@@ -814,6 +992,7 @@ export class Engine {
   tick(elapsedSeconds: number): void {
     this.broker.tick(elapsedSeconds);
     this.runPipeline();
+    this.persistRuntime();
   }
 
   snapshot() {
@@ -823,6 +1002,7 @@ export class Engine {
     const daily = computeDailyResult(this.day, openPositions, this.riskSettings);
     return {
       now: this.clock.nowIso(),
+      persistence: { enabled: this.store != null, path: this.store?.path ?? null },
       mode: this.mode,
       automationPaused: this.automationPaused,
       account,

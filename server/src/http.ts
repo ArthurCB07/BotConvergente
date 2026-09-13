@@ -3,6 +3,7 @@ import express from 'express';
 import { brokerCatalog } from './brokers/registry.ts';
 import { parseFreeText } from './core/ingestion.ts';
 import { INSTRUMENTS } from './core/instruments.ts';
+import { SCHEMA_VERSION } from './infra/store.ts';
 import {
   defaultConvergenceSettings,
   defaultRiskSettings,
@@ -10,6 +11,7 @@ import {
 } from './core/settings.ts';
 import type { Engine } from './engine/engine.ts';
 import { scenarioByKey, scenarios } from './scenarios.ts';
+import { seed } from './seed.ts';
 import type { SignalGenerator } from './sources/generator.ts';
 import type { OperationMode, Side, Venue } from './core/types.ts';
 
@@ -270,6 +272,33 @@ export function createApp(engine: Engine, generator: SignalGenerator) {
     await engine.broker.closePosition(String(req.params.id), 'MANUAL');
     engine.runPipeline();
     res.json({ ok: true });
+  });
+
+  // --- Banco -----------------------------------------------------------------
+
+  app.get('/api/db', (_req, res) => {
+    if (!engine.store) return res.json({ enabled: false });
+    res.json({
+      enabled: true,
+      path: engine.store.path,
+      schemaVersion: SCHEMA_VERSION,
+      counts: engine.store.counts(),
+    });
+  });
+
+  /**
+   * Apaga o banco e semeia o ambiente de demonstracao de novo. Acao destrutiva e
+   * irreversivel: exige confirmacao explicita no corpo da requisicao.
+   */
+  app.post('/api/db/reset', (req, res) => {
+    if (!engine.store) return res.status(409).json({ error: 'Nenhum banco configurado.' });
+    if (req.body?.confirm !== 'APAGAR') {
+      return res.status(400).json({
+        error: 'Confirmacao ausente. Envie {"confirm":"APAGAR"} para apagar o banco.',
+      });
+    }
+    engine.resetEnvironment(seed);
+    res.json({ ok: true, counts: engine.store.counts() });
   });
 
   // --- Cenarios --------------------------------------------------------------
