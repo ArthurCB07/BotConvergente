@@ -1,0 +1,16 @@
+{
+  "name": "convergencia-sinais",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["server", "web"],
+  "scripts": {
+    "dev": "concurrently -n API,WEB -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm -w server run dev",
+    "dev:web": "npm -w web run dev",
+    "test": "npm -w server run test",
+    "build": "npm -w web run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

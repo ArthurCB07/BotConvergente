@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/components/opportunitycard.tsx","./src/components/quorum.tsx","./src/components/ui.tsx","./src/pages/configuracoes.tsx","./src/pages/convergencias.tsx","./src/pages/corretoras.tsx","./src/pages/fontes.tsx","./src/pages/home.tsx","./src/pages/operacoes.tsx"],"version":"5.9.3"}
