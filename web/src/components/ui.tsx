@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { MARKET_LABEL, type MarketId } from '../api.ts';
 
 export const SIDE_LABEL: Record<string, string> = { BUY: 'Compra', SELL: 'Venda' };
 export const MODE_LABEL: Record<string, string> = {
@@ -53,6 +54,15 @@ export function countdown(validUntil: string, now: string): string {
 }
 
 type Tone = 'ok' | 'block' | 'watch' | 'risk' | 'neutral' | 'long' | 'short';
+
+/** Etiqueta de mercado, com a cor de identidade daquele mercado. */
+export function MarketChip({ marketId }: { marketId: MarketId }) {
+  return (
+    <span className="market-chip" data-market={marketId}>
+      {MARKET_LABEL[marketId]}
+    </span>
+  );
+}
 
 export function Badge({ tone = 'neutral', children }: { tone?: Tone; children: ReactNode }) {
   return <span className={`badge badge-${tone}`}>{children}</span>;

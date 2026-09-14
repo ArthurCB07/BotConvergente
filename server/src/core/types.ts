@@ -1,12 +1,23 @@
 /**
- * Modelo de dominio do MVP.
+ * Modelo de dominio.
  *
- * Escopo declarado: FOREX SPOT (pares major). O campo `market` existe para permitir
- * expansao futura, mas o motor de convergencia recusa comparar sinais de mercados
- * ou ambientes de negociacao diferentes (ver `core/convergence.ts`).
+ * A plataforma opera DOIS mercados separados: FOREX e CRIPTO. Separados de
+ * verdade — fontes, convergencia, configuracoes, automacao, limites diarios e
+ * conta. Um sinal de um mercado nunca entra na contagem, no percentual nem no
+ * peso do outro.
+ *
+ * Dentro de cada mercado existe o `ProductType`, que diz o que pode ser comparado
+ * com o que. Cripto a vista e perpetuo sao produtos diferentes e nunca se
+ * misturam, mesmo sendo o mesmo par.
  */
 
-export type Market = 'FX_SPOT';
+/** Mercado de topo. Determina segmentacao de dados, configuracao e automacao. */
+export type MarketId = 'FOREX' | 'CRYPTO';
+
+export const MARKET_IDS: MarketId[] = ['FOREX', 'CRYPTO'];
+
+/** Classe de produto dentro do mercado. Define o que e comparavel. */
+export type ProductType = 'FX_SPOT' | 'CRYPTO_SPOT' | 'CRYPTO_PERP';
 
 /** Ambiente de negociacao. OTC e REGULAR nunca sao comparados entre si. */
 export type Venue = 'REGULAR' | 'OTC';
@@ -26,7 +37,9 @@ export type SignalStatus =
   | 'CANCELLED'
   | 'SUPERSEDED'
   | 'DUPLICATE'
-  | 'REJECTED';
+  | 'REJECTED'
+  /** Mercado do sinal nao bate com o cadastro da fonte. */
+  | 'MARKET_MISMATCH';
 
 export interface SignalIssue {
   code: string;
@@ -57,9 +70,12 @@ export interface Signal {
   /** Confianca do interpretador de linguagem natural, quando houver. 0..1 */
   parserConfidence: number | null;
 
-  market: Market;
+  marketId: MarketId;
+  productType: ProductType;
   symbol: string;
   venue: Venue;
+  /** Moeda de cotacao do par. Preservada para nao comparar USDT com USD as cegas. */
+  quoteCurrency: string;
   broker: string | null;
 
   side: Side | null;
@@ -97,6 +113,15 @@ export interface Source {
   name: string;
   kind: 'GENERATOR' | 'MANUAL' | 'WEBHOOK' | 'TELEGRAM' | 'DISCORD' | 'API';
   enabled: boolean;
+  /**
+   * Mercados que esta fonte atende. Uma sala que publica os dois mercados fica
+   * cadastrada uma vez com os dois: cada sinal e roteado para o mercado correto e
+   * a fonte continua valendo UM voto em cada mercado, nunca dois no mesmo.
+   *
+   * Lista vazia = mercado nao classificado. A fonte nao vota em lugar nenhum e a
+   * interface pede a classificacao. Registro de origem incerta nunca e descartado.
+   */
+  markets: MarketId[];
   /** Etiquetas livres do usuario. Nao afetam a contagem de votos. */
   tags: string[];
   /**
@@ -105,7 +130,8 @@ export interface Source {
    * usuario nao declarar o contrario.
    */
   independenceGroupId: string;
-  weight: number;
+  /** Peso por mercado. Mercados tem pesos independentes. */
+  weightByMarket: Record<MarketId, number>;
   /** Token do webhook, quando kind === 'WEBHOOK'. Nunca exposto em logs. */
   webhookToken?: string;
   notes: string;
@@ -130,20 +156,33 @@ export type OpposingPolicy =
   | 'BLOCK_IF_ANY'
   | 'BLOCK_ABOVE_RATIO';
 
+/**
+ * Base do percentual de concordancia. A regra usada aparece sempre na interface,
+ * junto do numerador e do denominador.
+ */
+export type DenominatorMode =
+  /** Fontes habilitadas para aquele instrumento no mercado. Fonte sem sinal NAO concorda. */
+  | 'ENABLED_SOURCES'
+  /** Apenas fontes com sinal valido e comparavel na janela. */
+  | 'COMPARABLE_SIGNALS';
+
 export interface ConvergenceSettings {
   minAgreeingSources: number;
   minAgreementPercent: number;
   criteriaMode: CriteriaMode;
+  denominatorMode: DenominatorMode;
   /** Janela de agrupamento: sinais dentro deste intervalo sao comparados. */
   groupingWindowMinutes: number;
   /** Idade maxima de um sinal para continuar votando. */
   maxSignalAgeMinutes: number;
   includedSourceIds: string[] | null;
   excludedSourceIds: string[];
+  /** Instrumentos permitidos neste mercado. `null` = todos do catalogo. */
+  allowedSymbols: string[] | null;
   opposingPolicy: OpposingPolicy;
   /** Usado quando opposingPolicy === 'BLOCK_ABOVE_RATIO'. 0..1 */
   opposingBlockRatio: number;
-  /** Tolerancia entre precos de entrada, em pips do instrumento. */
+  /** Tolerancia entre precos de entrada, em ticks do instrumento. */
   entryTolerancePips: number;
   requireCompatibleTimeframe: boolean;
   /** Razao maxima entre o maior e o menor horizonte para serem compativeis. */
@@ -171,6 +210,11 @@ export interface NonParticipant {
   sourceId: string;
   sourceName: string;
   reason: string;
+  /**
+   * Quando o denominador e "fontes habilitadas", a fonte sem sinal entra no
+   * denominador mesmo assim — e este campo diz isso de forma explicita.
+   */
+  countedInDenominator: boolean;
 }
 
 export interface CriterionCheck {
@@ -191,12 +235,14 @@ export type OpportunityStatus =
 
 export interface Opportunity {
   id: string;
-  /** Chave estavel da convergencia. Atualizacoes reusam a mesma chave. */
+  /** Chave estavel da convergencia. Inclui o mercado. */
   clusterKey: string;
   version: number;
-  market: Market;
+  marketId: MarketId;
+  productType: ProductType;
   symbol: string;
   venue: Venue;
+  quoteCurrency: string;
   side: Side;
   createdAt: string;
   updatedAt: string;
@@ -218,6 +264,9 @@ export interface Opportunity {
   agreementPercent: number;
   weightedAgreementPercent: number;
   registeredActiveSources: number;
+  denominatorMode: DenominatorMode;
+  /** Frase curta explicando a regra do denominador usada. */
+  denominatorRule: string;
 
   criteria: CriterionCheck[];
   summary: string;
@@ -232,12 +281,14 @@ export interface Opportunity {
 
 export type OperationMode = 'OBSERVE' | 'SEMI_AUTO' | 'AUTO';
 
-export type SizingMode = 'FIXED_LOTS' | 'RISK_PERCENT';
+export type SizingMode = 'FIXED_QUANTITY' | 'RISK_PERCENT';
 
 export interface RiskSettings {
   sizingMode: SizingMode;
-  fixedLots: number;
+  /** Quantidade fixa na unidade do instrumento (lote em forex, unidade em cripto). */
+  fixedQuantity: number;
   riskPercentPerTrade: number;
+  /** Distancia padrao do stop, em ticks do instrumento. */
   defaultStopPips: number;
   defaultTakeProfitPips: number;
   useSignalStops: boolean;
@@ -267,15 +318,33 @@ export interface RiskSettings {
   martingaleEnabled: boolean;
 }
 
+/**
+ * Limites que valem para os dois mercados somados. Um limite global bloqueia
+ * novas entradas nos dois; nenhum mercado pode ignora-lo.
+ */
+export interface GlobalRiskSettings {
+  enabled: boolean;
+  maxOpenPositionsTotal: number;
+  maxTotalExposureNotional: number;
+  dailyLossLimitPercent: number;
+  dailyProfitTargetPercent: number;
+  /** Moeda de referencia para consolidar contas de moedas diferentes. */
+  referenceCurrency: string;
+}
+
 export interface RiskBlock {
   code: string;
   label: string;
   detail: string;
+  /** Se o bloqueio vale so para este mercado ou para os dois. */
+  scope: 'MARKET' | 'GLOBAL';
 }
 
 export interface SizingResult {
   mode: SizingMode;
-  lots: number;
+  /** Quantidade na unidade do instrumento. */
+  quantity: number;
+  quantityLabel: string;
   notionalValue: number;
   riskedValue: number;
   stopPips: number | null;
@@ -306,11 +375,17 @@ export interface Order {
   id: string;
   clientOrderId: string;
   brokerOrderId: string | null;
+  marketId: MarketId;
+  productType: ProductType;
+  /** Conta que recebeu a ordem. */
+  accountId: string;
+  brokerId: string;
   opportunityId: string | null;
   opportunityVersion: number | null;
   symbol: string;
   side: Side;
-  lots: number;
+  quantity: number;
+  quantityLabel: string;
   requestedPrice: number | null;
   filledPrice: number | null;
   stopLoss: number | null;
@@ -328,9 +403,14 @@ export interface Position {
   id: string;
   orderId: string;
   opportunityId: string | null;
+  marketId: MarketId;
+  productType: ProductType;
+  accountId: string;
+  brokerId: string;
   symbol: string;
   side: Side;
-  lots: number;
+  quantity: number;
+  quantityLabel: string;
   openPrice: number;
   openedAt: string;
   stopLoss: number | null;
@@ -353,10 +433,15 @@ export interface AccountSnapshot {
   accountId: string;
   accountType: 'SIMULADA' | 'DEMO_CORRETORA' | 'REAL';
   brokerId: string;
+  brokerName: string;
   currency: string;
+  /** Mercados que esta conta atende. */
+  markets: MarketId[];
   balance: number;
   equity: number;
   usedMargin: number;
+  /** Margem separada para ordens em voo, ainda nao preenchidas. */
+  reservedMargin: number;
   freeMargin: number;
   connected: boolean;
   lastUpdateAt: string;
@@ -380,6 +465,7 @@ export type EventKind =
   | 'SIGNAL_SUPERSEDED'
   | 'SIGNAL_CANCELLED'
   | 'SIGNAL_DUPLICATE'
+  | 'SIGNAL_MARKET_MISMATCH'
   | 'OPPORTUNITY_PUBLISHED'
   | 'OPPORTUNITY_UPDATED'
   | 'OPPORTUNITY_EXPIRED'
@@ -392,6 +478,7 @@ export type EventKind =
   | 'ORDER_RECONCILED'
   | 'POSITION_CLOSED'
   | 'MODE_CHANGED'
+  | 'AUTOMATION_CHANGED'
   | 'SETTINGS_CHANGED'
   | 'CONNECTION_LOST'
   | 'CONNECTION_RESTORED'
@@ -404,6 +491,8 @@ export interface AuditEvent {
   at: string;
   kind: EventKind;
   severity: 'INFO' | 'WARN' | 'BLOCK' | 'SUCCESS';
+  /** `null` quando o evento e global (pausa geral, limite global, banco). */
+  marketId: MarketId | null;
   title: string;
   detail: string;
   refs: {
@@ -414,3 +503,14 @@ export interface AuditEvent {
     positionId?: string;
   };
 }
+
+export const MARKET_LABEL: Record<MarketId, string> = {
+  FOREX: 'Forex',
+  CRYPTO: 'Cripto',
+};
+
+export const PRODUCT_LABEL: Record<ProductType, string> = {
+  FX_SPOT: 'Forex a vista',
+  CRYPTO_SPOT: 'Cripto a vista',
+  CRYPTO_PERP: 'Cripto perpetuo',
+};

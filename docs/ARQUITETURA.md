@@ -1,5 +1,35 @@
 # Arquitetura
 
+## Separação por mercado
+
+O motor roda **um pipeline por mercado**. Forex e Cripto não se enxergam: fontes, sinais,
+convergência, configurações, automação, estado do dia e conta são independentes. Os únicos pontos de
+contato são deliberados e explícitos:
+
+1. **Limites globais** — posições, exposição, stop diário e stop win somados. Bloqueiam os dois.
+2. **Pausa global** — bloqueia novas entradas automáticas nos dois.
+3. **Conta compartilhada** — quando os dois mercados usam a mesma conta, a margem é reservada de
+   forma coordenada antes de cada envio.
+
+```
+              fontes (com markets: [FOREX] | [CRYPTO] | ambos)
+                              |
+        +---------------------+---------------------+
+        |                                           |
+   pipeline FOREX                              pipeline CRYPTO
+   convergência, risco,                        convergência, risco,
+   automação, dia                              automação, dia
+        |                                           |
+        +---------------------+---------------------+
+                              |
+                    limites globais + pausa global
+                    + reserva de margem coordenada
+```
+
+`MarketId` é o mercado de topo (segmentação, configuração, automação). `ProductType` é o que decide
+comparabilidade dentro do mercado: `FX_SPOT`, `CRYPTO_SPOT`, `CRYPTO_PERP`. A chave do agrupamento é
+`MERCADO|PRODUTO|SÍMBOLO|AMBIENTE|DIREÇÃO`.
+
 ## Separação de camadas
 
 ```
@@ -52,8 +82,11 @@ da entrada, validade não vencida, emissão não futura, atraso de entrega sinal
 
 ### Convergência
 
-1. Filtra sinais `VALID`, de fontes ativas, dentro da idade máxima e da lista de inclusão/exclusão.
-2. Agrupa por `mercado | instrumento | ambiente`. **OTC e regular nunca entram no mesmo balde.**
+0. Recebe o `marketId` e só olha sinais daquele mercado, de fontes cadastradas para ele.
+1. Filtra sinais `VALID`, de fontes ativas, dentro da idade máxima, da lista de inclusão/exclusão e
+   da lista de instrumentos permitidos do mercado.
+2. Agrupa por `produto | instrumento | ambiente`. **OTC e regular nunca entram no mesmo balde, e à
+   vista nunca entra no mesmo balde que perpétuo.**
 3. Reduz a **um voto vigente por grupo de independência** — o mais recente vence; o anterior vira
    não participante com o motivo explícito.
 4. Ancora a janela no sinal mais recente e descarta o que estiver fora dela.
@@ -61,9 +94,14 @@ da entrada, validade não vencida, emissão não futura, atraso de entrega sinal
 6. Calcula o preço de referência pela **mediana** das entradas concordantes.
 7. Move para "não comparáveis" quem estiver fora da tolerância de preço em pips ou com horizonte
    fora da razão configurada.
-8. **Denominador** = grupos de independência com sinal válido e comparável na janela. A política
-   de contrários decide se o divergente entra no denominador, é ignorado ou bloqueia a
-   convergência.
+8. **Denominador**, conforme a regra escolhida no mercado:
+   - `COMPARABLE_SIGNALS` (padrão) — grupos com sinal válido e comparável na janela.
+   - `ENABLED_SOURCES` — todos os grupos habilitados para aquele instrumento no mercado. Fonte sem
+     sinal **não** conta como concordante: o silêncio pesa contra.
+
+   A política de contrários decide se o divergente entra no denominador, é ignorado ou bloqueia a
+   convergência. Numerador, denominador e a regra usada aparecem sempre juntos, na oportunidade e na
+   tela Convergências. A **quantidade mínima de confirmações** é parâmetro separado do percentual.
 9. Fontes cadastradas e ativas que não participaram são listadas com o motivo.
 
 A saída é uma avaliação por agrupamento — inclusive as que **não** passaram no corte, que
@@ -78,13 +116,35 @@ em vez de criar outra. Passada a validade, uma nova concordância é outra oport
 identificador próprio. O limite `maxExecutionsPerOpportunity` (padrão 1) garante que atualização
 não vira entrada involuntária.
 
+### Automação e pausa
+
+`evaluateRisk` recebe a origem do pedido. Os portões `AUTOMACAO_MERCADO_DESLIGADA` e `PAUSA_GLOBAL`
+só bloqueiam quando `origin === 'AUTO'`; numa confirmação manual viram aviso. Desligar a automação
+impede novas entradas **automáticas** daquele mercado — não encerra posições, não remove stop e alvo,
+não para a ingestão de sinais nem a publicação de oportunidades.
+
+### Reserva coordenada de margem
+
+Quando Forex e Cripto usam a mesma conta e convergem ao mesmo tempo, sem coordenação as duas
+avaliações de risco veriam a mesma margem livre e as duas ordens sairiam comprometendo o mesmo saldo.
+
+`executeInner` chama `broker.reserveMargin(clientOrderId, margem)` **de forma síncrona, antes do
+primeiro `await`**. A reserva entra imediatamente no cálculo de `freeMargin` da conta, então a
+segunda avaliação já enxerga o saldo reduzido. A reserva é liberada no `finally` — a partir daí a
+margem da posição aberta conta como usada.
+
 ### Risco
 
 `evaluateRisk` avalia **todos** os portões, mesmo depois do primeiro bloqueio, para que a
 interface mostre a lista completa em vez do primeiro motivo. Ordem: modo e pausa, conexão e
 frescor da cotação, validade da oportunidade, idempotência, limites do dia, pausa por perdas,
 intervalo entre entradas, posições abertas, janela de horário, spread, desvio de preço,
-dimensionamento, exposição por ativo, exposição total, margem livre.
+dimensionamento, exposição por ativo, exposição do mercado, margem livre e, por cima de tudo, os
+**limites globais** (posições somadas, exposição somada na moeda de referência, stop diário e stop
+win consolidados).
+
+Cada bloqueio carrega `scope: 'MARKET' | 'GLOBAL'`, e a interface mostra qual é qual. Um bloqueio de
+mercado para só aquele mercado; um bloqueio global para os dois.
 
 Nenhum modo operacional pula esses portões. "Executar sempre que convergir" dispensa a confirmação
 manual, não os limites.
@@ -115,11 +175,20 @@ orquestrador consulta a corretora por essa chave; se já houver execução, não
 requisição expirar sem resposta, ele **consulta o estado antes de qualquer reenvio** e reconcilia.
 Uma trava em memória impede que duas passagens do pipeline entrem no mesmo envio.
 
-## Contrato de corretora
+## Contrato de conexão
 
-`BrokerAdapter` define conta, cotação, envio, busca por chave de cliente, posições, encerramento e
-cancelamento de pendentes. O `PaperBroker` implementa tudo localmente. MetaTrader 5 e cTrader
-aparecem no catálogo com `status: NOT_IMPLEMENTED` e a lista do que falta.
+`BrokerAdapter` vale para corretora de forex e para exchange de cripto: conta, cotação, envio, busca
+por chave de cliente, reserva de margem, posições, encerramento e cancelamento de pendentes.
+
+Cada conexão declara **quais mercados atende** (`markets`) e responde `supportsSymbol(symbol)`. O
+motor de risco bloqueia com `INSTRUMENTO_NAO_SUPORTADO` antes de qualquer envio: uma conexão de forex
+não opera cripto por presunção. A escolha de conta é **por mercado**, e a lista oferecida ao usuário
+só mostra conexões compatíveis.
+
+`PaperBroker` implementa tudo localmente. Existem duas contas simuladas: `paper` (USD, atende os dois
+mercados — exercita a reserva coordenada) e `paper-crypto` (USDT, só cripto — exercita o caso de
+contas separadas). MetaTrader 5 e cTrader (Forex), Binance e Bybit (Cripto) aparecem no catálogo com
+`status: NOT_IMPLEMENTED` e a lista do que falta.
 
 Credenciais ficam no backend, fora do frontend e fora dos logs. Nenhum `describe()` devolve
 segredo.
@@ -129,6 +198,37 @@ segredo.
 REST para comandos e leitura de estado; `GET /api/stream` (SSE) para avisar a interface de que o
 estado mudou — a interface então recarrega o instantâneo. Simples de entender e suficiente para o
 protótipo; substituível por WebSocket com diffs quando o volume justificar.
+
+## Cotação de referência
+
+`server/src/quotes/` traz o cliente da AwesomeAPI e o serviço de cache. Uma instância por processo,
+consulta em lote, trava de concorrência, recuo exponencial e `Retry-After` respeitado. Detalhes,
+pares suportados, tratamento de falha e regra de desatualização em
+[COTACOES.md](COTACOES.md).
+
+Dois pontos do motor passam a usar o preço de referência quando ele existe: a checagem de
+plausibilidade do sinal e a âncora do preço simulado de Forex. A âncora é recusada com posição
+aberta no instrumento. O preço simulado continua simulado entre atualizações, e a interface separa
+os dois em cartões distintos.
+
+## Entrada de sinais pelo Telegram
+
+`server/src/telegram/` conecta a **conta do usuário** por MTProto (`teleproto`, fork mantido do
+GramJS arquivado). A camada tem quatro peças: tipos, perfis de interpretação, o serviço com a
+máquina de estados de autenticação e o *bridge* para o motor.
+
+A decisão que evita código duplicado: **cada sala monitorada vira uma `Source` comum** do motor
+(`kind: 'TELEGRAM'`, id `src_tg_<peerId>`), e cada mensagem entra por `engine.ingestSignal()` com
+`externalMessageId = tg:<peerId>:<messageId>`. Com isso, duplicata, edição, versionamento e a
+contagem de um voto por grupo de independência são exatamente os mesmos de qualquer outra fonte —
+nenhuma regra paralela.
+
+`participatesInConvergence` de uma sala vira o `enabled` da fonte: mensagem de sala sem voto
+continua sendo recebida, registrada e exibida; ela só não entra na contagem.
+
+Credenciais, sessão, telefone completo, código e senha não saem do backend. As rotas
+`/api/telegram/*` ficam fora de `/api/state` e têm guarda própria. Detalhes em
+[TELEGRAM.md](TELEGRAM.md).
 
 ## Persistência
 
@@ -144,7 +244,24 @@ continuam possíveis. O esquema tem versão; um banco mais novo que o código é
 em vez de ser lido pela metade.
 
 **O que é gravado por linha:** fontes, sinais, oportunidades, ordens, posições e eventos de
-auditoria — no momento da mudança.
+auditoria — no momento da mudança, cada um com sua coluna `market_id` indexada.
+
+**Migração v1 → v2.** O produto passou de um mercado para dois. A migração leva a base existente
+(toda de forex) para `FOREX` preservando os dados: `weight` vira `weightByMarket`, `lots` vira
+`quantity`, `settings.convergence` vira `settings.convergence.FOREX`, `runtime.mode` vira
+`runtime.market.FOREX` (com automação **desligada**, para o usuário ligar conscientemente). Fonte
+cujo histórico só tem instrumento fora do catálogo fica **sem mercado classificado** — nada é
+descartado, e a interface pede a classificação. Os índices que citam colunas novas são criados
+**depois** da migração.
+
+**Migração v2 → v3.** Entraram `telegram_rooms` e `telegram_activity`. Nenhuma tabela existente muda
+de formato, então não há conversão de dado: as tabelas novas nascem vazias e o resto fica como
+estava.
+
+**Reiniciar o ambiente preserva o Telegram.** `wipe()` apaga o mundo simulado, porém mantém a sessão
+autenticada e as salas escolhidas (chaves `telegram.*`) — reiniciar a demonstração não deve custar um
+novo login. As fontes somem junto com o resto, então cada sala fica com `sourceId` nulo e refaz o
+vínculo na próxima mensagem.
 
 **O que é gravado em chave e valor:** modo operacional, pausa da automação, configurações de
 convergência e de risco, estado do dia e estado do simulador (saldo, posições abertas, mapa de

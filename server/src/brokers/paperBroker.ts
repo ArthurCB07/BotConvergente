@@ -1,7 +1,9 @@
 import {
   INSTRUMENTS,
+  getInstrument,
   notionalValue,
-  pipValueUsd,
+  pipSizeFor,
+  pipValue,
   requireInstrument,
   requiredMargin,
   roundPrice,
@@ -9,7 +11,7 @@ import {
 } from '../core/instruments.ts';
 import { id } from '../core/ids.ts';
 import type { Clock } from '../core/time.ts';
-import type { AccountSnapshot, Position, Quote } from '../core/types.ts';
+import type { AccountSnapshot, MarketId, Position, Quote } from '../core/types.ts';
 import type {
   BrokerAdapter,
   BrokerDescriptor,
@@ -18,16 +20,25 @@ import type {
 } from './types.ts';
 
 /**
- * Corretora SIMULADA.
+ * Conta SIMULADA.
  *
- * Isto NAO e uma conexao com corretora. E um simulador local, usado para exercitar
- * o fluxo completo do produto sem enviar nada para fora. Os precos vem de um
- * passeio aleatorio com semente fixa; nao reproduzem o mercado e nao servem para
- * estimar resultado. A interface exibe o rotulo SIMULADA em todas as telas.
+ * Isto NAO e uma conexao com corretora nem com exchange. E um simulador local,
+ * usado para exercitar o fluxo do produto sem enviar nada para fora. Os precos vem
+ * de um passeio aleatorio com semente fixa; nao reproduzem o mercado e nao servem
+ * para estimar resultado. A interface exibe o rotulo SIMULADA em todas as telas.
+ *
+ * Uma instancia representa UMA conta. Ela pode atender os dois mercados (saldo
+ * compartilhado) ou apenas um (contas separadas), conforme a configuracao.
  */
 
-/** Comissao explicita por lote, ida e volta. Premissa de demonstracao. */
-const COMMISSION_PER_LOT_ROUND_TURN = 7;
+/** Comissao explicita por unidade de quantidade, ida e volta, na moeda da conta. */
+const COMMISSION_PER_UNIT_ROUND_TURN: Record<MarketId, number> = {
+  // USD 7 por lote em forex.
+  FOREX: 7,
+  // Aproxima 0,1% do nocional; calculado sobre o nocional, nao sobre a quantidade.
+  CRYPTO: 0,
+};
+const CRYPTO_COMMISSION_RATE = 0.001;
 
 class SeededRandom {
   private state: number;
@@ -65,6 +76,11 @@ interface PriceState {
 }
 
 export interface PaperBrokerOptions {
+  id: string;
+  name: string;
+  currency: string;
+  /** Mercados atendidos por esta conta. */
+  markets: MarketId[];
   clock: Clock;
   initialBalance?: number;
   seed?: number;
@@ -82,14 +98,21 @@ export interface PaperBrokerState {
 }
 
 export class PaperBroker implements BrokerAdapter {
+  readonly id: string;
+  private name: string;
+  private currency: string;
+  private markets: MarketId[];
   private clock: Clock;
   private rng: SeededRandom;
   private prices = new Map<string, PriceState>();
   private positions: Position[] = [];
   /** Idempotencia: clientOrderId -> resultado ja produzido. */
   private ordersByClientId = new Map<string, PlaceOrderResult>();
+  /** Margem reservada por ordens em voo. Chave = clientOrderId. */
+  private reservations = new Map<string, number>();
   private connected = false;
   private balance: number;
+  private initialBalance: number;
   private onPositionOpened?: (position: Position) => void;
   private onPositionClosed?: (position: Position) => void;
 
@@ -101,12 +124,18 @@ export class PaperBroker implements BrokerAdapter {
   public spreadMultiplier = 1;
 
   constructor(options: PaperBrokerOptions) {
+    this.id = options.id;
+    this.name = options.name;
+    this.currency = options.currency;
+    this.markets = options.markets;
     this.clock = options.clock;
     this.rng = new SeededRandom(options.seed ?? 20260913);
-    this.balance = options.initialBalance ?? 10_000;
+    this.initialBalance = options.initialBalance ?? 10_000;
+    this.balance = this.initialBalance;
     this.onPositionOpened = options.onPositionOpened;
     this.onPositionClosed = options.onPositionClosed;
     for (const instrument of INSTRUMENTS) {
+      if (!this.markets.includes(instrument.marketId)) continue;
       this.prices.set(instrument.symbol, {
         instrument,
         mid: instrument.referencePrice,
@@ -115,12 +144,22 @@ export class PaperBroker implements BrokerAdapter {
     }
   }
 
+  supportsSymbol(symbol: string): boolean {
+    const instrument = getInstrument(symbol);
+    return instrument != null && this.markets.includes(instrument.marketId);
+  }
+
   describe(): BrokerDescriptor {
     return {
-      id: 'paper',
-      name: 'Simulador local (conta simulada)',
-      status: this.connected ? 'CONNECTED' : 'DISCONNECTED',
-      markets: ['FX_SPOT'],
+      id: this.id,
+      name: this.name,
+      status: this.isConnected() ? 'CONNECTED' : 'DISCONNECTED',
+      markets: [...this.markets],
+      products: [
+        ...new Set(
+          INSTRUMENTS.filter((i) => this.markets.includes(i.marketId)).map((i) => i.productType),
+        ),
+      ],
       capabilities: {
         account: true,
         positions: true,
@@ -135,11 +174,12 @@ export class PaperBroker implements BrokerAdapter {
       requirements: [],
       restrictions: [
         'Precos gerados localmente por passeio aleatorio com semente fixa.',
-        'Nao reproduz liquidez, gaps de noticia nem rejeicoes reais de corretora.',
+        'Nao reproduz liquidez, gaps de noticia, funding de perpetuo nem rejeicoes reais.',
         'Resultados nao tem valor preditivo.',
       ],
       docsUrl: '',
       accountType: 'SIMULADA',
+      currency: this.currency,
     };
   }
 
@@ -163,10 +203,10 @@ export class PaperBroker implements BrokerAdapter {
     const now = this.clock.nowIso();
     for (const state of this.prices.values()) {
       const { instrument } = state;
-      // Volatilidade diaria em pips distribuida ao longo de 24h de negociacao.
+      // Volatilidade diaria em pips distribuida ao longo de 24h.
       const perSecondPips = instrument.dailyVolatilityPips / Math.sqrt(24 * 60 * 60);
       const deltaPips = this.rng.gauss() * perSecondPips * Math.sqrt(Math.max(elapsedSeconds, 0.001));
-      state.mid = state.mid + deltaPips * instrument.pipSize;
+      state.mid = state.mid + deltaPips * pipSizeFor(instrument, state.mid);
       state.at = now;
     }
     this.settleStops();
@@ -177,7 +217,7 @@ export class PaperBroker implements BrokerAdapter {
     const state = this.prices.get(symbol.toUpperCase());
     if (!state || !this.isConnected()) return null;
     const spreadPips = state.instrument.typicalSpreadPips * this.spreadMultiplier;
-    const half = (spreadPips * state.instrument.pipSize) / 2;
+    const half = (spreadPips * pipSizeFor(state.instrument, state.mid)) / 2;
     return {
       symbol: state.instrument.symbol,
       bid: roundPrice(state.instrument, state.mid - half),
@@ -188,14 +228,41 @@ export class PaperBroker implements BrokerAdapter {
   }
 
   getAllQuotes(): Quote[] {
-    return INSTRUMENTS.map((i) => this.getQuote(i.symbol)).filter((q): q is Quote => q != null);
+    return [...this.prices.keys()]
+      .map((symbol) => this.getQuote(symbol))
+      .filter((q): q is Quote => q != null);
+  }
+
+  /**
+   * Ancora o preco simulado em uma referencia externa.
+   *
+   * Recusa se houver posicao aberta no instrumento: um salto de preco com posicao
+   * viva dispararia stop ou alvo por um motivo que nao e movimento de mercado.
+   * Entre ancoras, o passeio aleatorio continua — o preco do simulador nunca e
+   * apresentado como cotacao real.
+   */
+  anchorPrice(symbol: string, mid: number): { applied: boolean; reason: string } {
+    const state = this.prices.get(symbol.toUpperCase());
+    if (!state) return { applied: false, reason: 'Instrumento fora desta conta.' };
+    if (!Number.isFinite(mid) || mid <= 0) return { applied: false, reason: 'Preco invalido.' };
+    if (this.positions.some((p) => p.status === 'OPEN' && p.symbol === state.instrument.symbol)) {
+      return { applied: false, reason: 'Posicao aberta no instrumento: ancoragem adiada.' };
+    }
+    const before = state.mid;
+    state.mid = mid;
+    state.at = this.clock.nowIso();
+    this.markToMarket();
+    return {
+      applied: true,
+      reason: `Preco simulado de ${state.instrument.symbol} reancorado de ${before.toFixed(state.instrument.digits)} para ${mid.toFixed(state.instrument.digits)}.`,
+    };
   }
 
   /** Empurra o preco em N pips. Usado apenas pelos cenarios de demonstracao. */
   nudge(symbol: string, pips: number): void {
     const state = this.prices.get(symbol.toUpperCase());
     if (!state) return;
-    state.mid += pips * state.instrument.pipSize;
+    state.mid += pips * pipSizeFor(state.instrument, state.mid);
     state.at = this.clock.nowIso();
     this.settleStops();
     this.markToMarket();
@@ -208,20 +275,23 @@ export class PaperBroker implements BrokerAdapter {
     const unrealized = open.reduce((s, p) => s + p.netPnl, 0);
     const usedMargin = open.reduce((s, p) => {
       const instrument = requireInstrument(p.symbol);
-      return s + requiredMargin(instrument, p.lots, p.openPrice);
+      return s + requiredMargin(instrument, p.quantity, p.openPrice);
     }, 0);
+    const reserved = [...this.reservations.values()].reduce((s, v) => s + v, 0);
     const equity = this.balance + unrealized;
-    const lastAt =
-      [...this.prices.values()].map((p) => p.at).sort().at(-1) ?? this.clock.nowIso();
+    const lastAt = [...this.prices.values()].map((p) => p.at).sort().at(-1) ?? this.clock.nowIso();
     return {
-      accountId: 'SIM-0001',
+      accountId: `SIM-${this.id.toUpperCase()}`,
       accountType: 'SIMULADA',
-      brokerId: 'paper',
-      currency: 'USD',
+      brokerId: this.id,
+      brokerName: this.name,
+      currency: this.currency,
+      markets: [...this.markets],
       balance: Math.round(this.balance * 100) / 100,
       equity: Math.round(equity * 100) / 100,
       usedMargin: Math.round(usedMargin * 100) / 100,
-      freeMargin: Math.round((equity - usedMargin) * 100) / 100,
+      reservedMargin: Math.round(reserved * 100) / 100,
+      freeMargin: Math.round((equity - usedMargin - reserved) * 100) / 100,
       connected: this.isConnected(),
       lastUpdateAt: lastAt,
     };
@@ -232,56 +302,27 @@ export class PaperBroker implements BrokerAdapter {
     this.balance += amount;
   }
 
-  // --- Persistencia ---------------------------------------------------------
-
-  serialize(): PaperBrokerState {
-    return {
-      balance: this.balance,
-      rngState: this.rng.getState(),
-      prices: [...this.prices.values()].map((p) => ({
-        symbol: p.instrument.symbol,
-        mid: p.mid,
-        at: p.at,
-      })),
-      positions: this.positions.map((p) => ({ ...p })),
-      orders: [...this.ordersByClientId.entries()].map(([clientOrderId, result]) => ({
-        clientOrderId,
-        result,
-      })),
-    };
-  }
+  // --- Reserva de margem ----------------------------------------------------
 
   /**
-   * Recarrega o estado salvo. Nao dispara `onPositionClosed`: as posicoes ja
-   * fechadas antes do reinicio ja foram contabilizadas no dia em que fecharam.
+   * Sincrono de proposito. O motor reserva ANTES de qualquer `await`, entao duas
+   * ordens de mercados diferentes na mesma conta nunca enxergam a mesma margem
+   * livre como disponivel.
    */
-  /** Volta ao estado inicial. Usado pelo reinicio do ambiente de demonstracao. */
-  reset(balance: number, seed: number): void {
-    this.balance = balance;
-    this.rng.setState(seed);
-    this.positions = [];
-    this.ordersByClientId = new Map();
-    this.failureMode = 'NONE';
-    this.freezeQuotes = false;
-    this.spreadMultiplier = 1;
-    for (const state of this.prices.values()) {
-      state.mid = state.instrument.referencePrice;
-      state.at = this.clock.nowIso();
+  reserveMargin(key: string, amount: number): boolean {
+    if (this.reservations.has(key)) return true;
+    if (amount <= 0) {
+      this.reservations.set(key, 0);
+      return true;
     }
+    const account = this.getAccount();
+    if (amount > account.freeMargin) return false;
+    this.reservations.set(key, amount);
+    return true;
   }
 
-  restore(state: PaperBrokerState): void {
-    this.balance = state.balance;
-    this.rng.setState(state.rngState);
-    for (const price of state.prices) {
-      const current = this.prices.get(price.symbol);
-      if (current) {
-        current.mid = price.mid;
-        current.at = price.at;
-      }
-    }
-    this.positions = state.positions.map((p) => ({ ...p }));
-    this.ordersByClientId = new Map(state.orders.map((o) => [o.clientOrderId, o.result]));
+  releaseMargin(key: string): void {
+    this.reservations.delete(key);
   }
 
   // --- Ordens ---------------------------------------------------------------
@@ -290,24 +331,25 @@ export class PaperBroker implements BrokerAdapter {
     // Idempotencia: mesma chave de cliente devolve o resultado anterior.
     const existing = this.ordersByClientId.get(req.clientOrderId);
     if (existing) {
-      if (existing.status === 'FILLED') {
-        return { ...existing, status: 'DUPLICATE' };
-      }
+      if (existing.status === 'FILLED') return { ...existing, status: 'DUPLICATE' };
       return existing;
     }
 
     if (!this.isConnected()) {
-      const result: PlaceOrderResult = {
+      return { status: 'REJECTED', reason: 'Conexao indisponivel no momento do envio.' };
+    }
+
+    if (!this.supportsSymbol(req.symbol)) {
+      return {
         status: 'REJECTED',
-        reason: 'Corretora desconectada no momento do envio.',
+        reason: `${this.name} nao negocia ${req.symbol}.`,
       };
-      return result;
     }
 
     if (this.failureMode === 'REJECT') {
       const result: PlaceOrderResult = {
         status: 'REJECTED',
-        reason: 'Rejeicao simulada pela corretora (modo de falha ativo).',
+        reason: 'Rejeicao simulada pela conexao (modo de falha ativo).',
       };
       this.ordersByClientId.set(req.clientOrderId, result);
       return result;
@@ -315,8 +357,13 @@ export class PaperBroker implements BrokerAdapter {
 
     const instrument = requireInstrument(req.symbol);
     const quote = this.getQuote(req.symbol);
-    if (!quote) {
-      return { status: 'REJECTED', reason: 'Sem cotacao para o instrumento.' };
+    if (!quote) return { status: 'REJECTED', reason: 'Sem cotacao para o instrumento.' };
+
+    if (req.quantity < instrument.minQuantity) {
+      return {
+        status: 'REJECTED',
+        reason: `Quantidade ${req.quantity} abaixo do minimo ${instrument.minQuantity} ${instrument.quantityLabel}.`,
+      };
     }
 
     if (this.failureMode === 'TIMEOUT') {
@@ -328,12 +375,19 @@ export class PaperBroker implements BrokerAdapter {
        */
       const filled = this.fill(req, instrument, quote.bid, quote.ask);
       this.ordersByClientId.set(req.clientOrderId, filled);
-      return { status: 'TIMEOUT', reason: 'Sem resposta da corretora dentro do tempo limite.' };
+      return { status: 'TIMEOUT', reason: 'Sem resposta da conexao dentro do tempo limite.' };
     }
 
     const filled = this.fill(req, instrument, quote.bid, quote.ask);
     this.ordersByClientId.set(req.clientOrderId, filled);
     return filled;
+  }
+
+  private commissionFor(instrument: Instrument, quantity: number, price: number): number {
+    if (instrument.marketId === 'CRYPTO') {
+      return notionalValue(instrument, quantity, price) * CRYPTO_COMMISSION_RATE * 2;
+    }
+    return COMMISSION_PER_UNIT_ROUND_TURN[instrument.marketId] * quantity;
   }
 
   private fill(
@@ -344,16 +398,22 @@ export class PaperBroker implements BrokerAdapter {
   ): PlaceOrderResult {
     // Deslizamento simulado: fracao do spread, sempre contra o operador.
     const slipPips = Math.abs(this.rng.gauss()) * 0.3;
-    const raw = req.side === 'BUY' ? ask + slipPips * instrument.pipSize : bid - slipPips * instrument.pipSize;
+    const pip = pipSizeFor(instrument, (bid + ask) / 2);
+    const raw = req.side === 'BUY' ? ask + slipPips * pip : bid - slipPips * pip;
     const price = roundPrice(instrument, raw);
 
     const position: Position = {
       id: id('pos'),
       orderId: req.clientOrderId,
       opportunityId: null,
+      marketId: instrument.marketId,
+      productType: instrument.productType,
+      accountId: `SIM-${this.id.toUpperCase()}`,
+      brokerId: this.id,
       symbol: req.symbol,
       side: req.side,
-      lots: req.lots,
+      quantity: req.quantity,
+      quantityLabel: instrument.quantityLabel,
       openPrice: price,
       openedAt: this.clock.nowIso(),
       stopLoss: req.stopLoss,
@@ -363,15 +423,15 @@ export class PaperBroker implements BrokerAdapter {
       closeReason: null,
       status: 'OPEN',
       grossPnl: 0,
-      costs: Math.round(COMMISSION_PER_LOT_ROUND_TURN * req.lots * 100) / 100,
+      costs: Math.round(this.commissionFor(instrument, req.quantity, price) * 100) / 100,
       netPnl: 0,
-      notionalValue: Math.round(notionalValue(instrument, req.lots, price) * 100) / 100,
+      notionalValue: Math.round(notionalValue(instrument, req.quantity, price) * 100) / 100,
       riskedValue:
         req.stopLoss == null
           ? 0
           : Math.round(
-              pipValueUsd(instrument, req.lots) *
-                (Math.abs(price - req.stopLoss) / instrument.pipSize) *
+              pipValue(instrument, req.quantity, price) *
+                (Math.abs(price - req.stopLoss) / pipSizeFor(instrument, price)) *
                 100,
             ) / 100,
       simulated: true,
@@ -421,8 +481,8 @@ export class PaperBroker implements BrokerAdapter {
     const instrument = requireInstrument(position.symbol);
     const pips =
       (position.side === 'BUY' ? exitPrice - position.openPrice : position.openPrice - exitPrice) /
-      instrument.pipSize;
-    return pipValueUsd(instrument, position.lots) * pips;
+      pipSizeFor(instrument, position.openPrice);
+    return pipValue(instrument, position.quantity, position.openPrice) * pips;
   }
 
   private markToMarket(): void {
@@ -465,5 +525,59 @@ export class PaperBroker implements BrokerAdapter {
     position.status = 'CLOSED';
     this.balance += position.netPnl;
     this.onPositionClosed?.({ ...position });
+  }
+
+  // --- Persistencia ---------------------------------------------------------
+
+  serialize(): PaperBrokerState {
+    return {
+      balance: this.balance,
+      rngState: this.rng.getState(),
+      prices: [...this.prices.values()].map((p) => ({
+        symbol: p.instrument.symbol,
+        mid: p.mid,
+        at: p.at,
+      })),
+      positions: this.positions.map((p) => ({ ...p })),
+      orders: [...this.ordersByClientId.entries()].map(([clientOrderId, result]) => ({
+        clientOrderId,
+        result,
+      })),
+    };
+  }
+
+  /** Volta ao estado inicial. Usado pelo reinicio do ambiente de demonstracao. */
+  reset(balance: number, seed: number): void {
+    this.balance = balance;
+    this.rng.setState(seed);
+    this.positions = [];
+    this.ordersByClientId = new Map();
+    this.reservations = new Map();
+    this.failureMode = 'NONE';
+    this.freezeQuotes = false;
+    this.spreadMultiplier = 1;
+    for (const state of this.prices.values()) {
+      state.mid = state.instrument.referencePrice;
+      state.at = this.clock.nowIso();
+    }
+  }
+
+  /**
+   * Recarrega o estado salvo. Nao dispara `onPositionClosed`: as posicoes ja
+   * fechadas antes do reinicio ja foram contabilizadas no dia em que fecharam.
+   */
+  restore(state: PaperBrokerState): void {
+    this.balance = state.balance;
+    this.rng.setState(state.rngState);
+    for (const price of state.prices) {
+      const current = this.prices.get(price.symbol);
+      if (current) {
+        current.mid = price.mid;
+        current.at = price.at;
+      }
+    }
+    this.positions = state.positions.map((p) => ({ ...p }));
+    this.ordersByClientId = new Map(state.orders.map((o) => [o.clientOrderId, o.result]));
+    this.reservations = new Map();
   }
 }

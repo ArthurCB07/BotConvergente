@@ -2,7 +2,9 @@ import { getInstrument } from './instruments.ts';
 import { stableHash, id } from './ids.ts';
 import { minutesBetween } from './time.ts';
 import type {
+  MarketId,
   ParserKind,
+  ProductType,
   RawMessage,
   Side,
   Signal,
@@ -11,6 +13,7 @@ import type {
   Venue,
   EntryType,
 } from './types.ts';
+import { MARKET_LABEL, PRODUCT_LABEL } from './types.ts';
 
 /**
  * Camada de ingestao: mensagem bruta -> sinal normalizado -> validacao determinista.
@@ -19,6 +22,11 @@ import type {
  * modelo de linguagem) produz apenas um RASCUNHO. O rascunho passa por
  * `validateSignal`, que e deterministico, antes de chegar ao motor de convergencia.
  * Sinal marcado como AMBIGUOUS nunca vota e nunca gera operacao automatica.
+ *
+ * Roteamento de mercado: o mercado do sinal vem do instrumento, nunca do palpite
+ * de quem enviou. Se o mercado resultante nao estiver no cadastro da fonte, o sinal
+ * e marcado MARKET_MISMATCH: fica registrado e visivel, porem fora da convergencia
+ * dos dois mercados.
  */
 
 /** Confianca minima do interpretador para o sinal ser considerado nao ambiguo. */
@@ -33,8 +41,11 @@ export interface SignalInput {
   parserConfidence?: number | null;
   action?: IngestAction;
 
+  /** Mercado declarado pela origem. Conferido contra o instrumento. */
+  marketId?: MarketId | null;
   symbol?: string | null;
   venue?: Venue | null;
+  productType?: ProductType | null;
   broker?: string | null;
   side?: Side | null;
   emittedAt?: string | null;
@@ -57,6 +68,12 @@ export interface IngestContext {
   /** Sinais ja conhecidos desta fonte, do mais recente para o mais antigo. */
   existing: Signal[];
   defaultTimezone: string;
+  /**
+   * Preco de referencia vigente do instrumento, quando houver fonte externa. Usado
+   * apenas na checagem de plausibilidade: sem ele, vale o preco do catalogo, que e
+   * um valor inicial arbitrario e envelhece.
+   */
+  referencePriceOf?: (symbol: string) => number | null;
 }
 
 export type IngestOutcome =
@@ -74,6 +91,7 @@ const SELL_WORDS = ['venda', 'vender', 'sell', 'short', 'baixa', 'put'];
 
 export interface ParsedDraft {
   symbol: string | null;
+  marketId: MarketId | null;
   side: Side | null;
   entryPrice: number | null;
   stopLoss: number | null;
@@ -103,12 +121,16 @@ export function parseFreeText(text: string): ParsedDraft {
    * So aceita como instrumento aquilo que existe no catalogo. Sem esta checagem,
    * uma palavra de seis letras como "COMPRA" seria lida como par de moedas.
    */
-  const candidates = text.toUpperCase().match(/\b([A-Z]{6}(?:-OTC)?|[A-Z]{3}\/[A-Z]{3})\b/g) ?? [];
+  const candidates =
+    text.toUpperCase().match(/\b[A-Z]{3,12}(?:-OTC|-PERP)?\b|\b[A-Z]{3,5}\/[A-Z]{3,5}\b/g) ?? [];
   let symbol: string | null = null;
+  let marketId: MarketId | null = null;
   for (const candidate of candidates) {
     const normalized = candidate.replace('/', '');
-    if (getInstrument(normalized)) {
-      symbol = normalized;
+    const instrument = getInstrument(normalized);
+    if (instrument) {
+      symbol = instrument.symbol;
+      marketId = instrument.marketId;
       break;
     }
   }
@@ -117,13 +139,21 @@ export function parseFreeText(text: string): ParsedDraft {
   const num = (re: RegExp): number | null => {
     const m = lower.match(re);
     if (!m?.[1]) return null;
+    const v = Number(m[1].replace(/\./g, '').replace(',', '.'));
+    return Number.isFinite(v) ? v : null;
+  };
+
+  const numPlain = (re: RegExp): number | null => {
+    const m = lower.match(re);
+    if (!m?.[1]) return null;
     const v = Number(m[1].replace(',', '.'));
     return Number.isFinite(v) ? v : null;
   };
 
-  const entryPrice = num(/(?:entrada|entry|@|preco)\s*:?\s*([0-9]+[.,][0-9]+)/);
-  const stopLoss = num(/(?:sl|stop|stop loss)\s*:?\s*([0-9]+[.,][0-9]+)/);
-  const takeProfit = num(/(?:tp|alvo|take profit)\s*:?\s*([0-9]+[.,][0-9]+)/);
+  const entryPrice = numPlain(/(?:entrada|entry|@|preco)\s*:?\s*([0-9]+(?:[.,][0-9]+)?)/);
+  const stopLoss = numPlain(/(?:sl|stop|stop loss)\s*:?\s*([0-9]+(?:[.,][0-9]+)?)/);
+  const takeProfit = numPlain(/(?:tp|alvo|take profit)\s*:?\s*([0-9]+(?:[.,][0-9]+)?)/);
+  void num;
 
   const tfMatch = lower.match(/\b(m|h)\s?(\d{1,3})\b/);
   let timeframeMinutes: number | null = null;
@@ -138,7 +168,17 @@ export function parseFreeText(text: string): ParsedDraft {
   if (entryPrice === null) confidence -= 0.1;
   confidence = Math.max(0, Math.round(confidence * 100) / 100);
 
-  return { symbol, side, entryPrice, stopLoss, takeProfit, timeframeMinutes, confidence, notes };
+  return {
+    symbol,
+    marketId,
+    side,
+    entryPrice,
+    stopLoss,
+    takeProfit,
+    timeframeMinutes,
+    confidence,
+    notes,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -170,9 +210,12 @@ function normalize(input: SignalInput, ctx: IngestContext): Signal {
     parsedBy: input.parsedBy,
     parserConfidence: input.parserConfidence ?? null,
 
-    market: 'FX_SPOT',
+    // O mercado vem do instrumento. O campo declarado serve apenas para conferencia.
+    marketId: instrument?.marketId ?? input.marketId ?? 'FOREX',
+    productType: instrument?.productType ?? input.productType ?? 'FX_SPOT',
     symbol,
     venue: input.venue ?? instrument?.venue ?? 'REGULAR',
+    quoteCurrency: instrument?.quote ?? 'USD',
     broker: input.broker ?? null,
 
     side: input.side ?? null,
@@ -204,7 +247,13 @@ function normalize(input: SignalInput, ctx: IngestContext): Signal {
  * Validacao determinista. Nao depende de modelo, de aleatoriedade nem de
  * configuracao do usuario: as mesmas entradas produzem sempre o mesmo resultado.
  */
-export function validateSignal(signal: Signal, nowIso: string): Signal {
+export function validateSignal(
+  signal: Signal,
+  nowIso: string,
+  source?: Pick<Source, 'markets' | 'name'>,
+  declaredMarketId?: MarketId | null,
+  liveReferencePrice?: number | null,
+): Signal {
   const issues: SignalIssue[] = [];
   let status: Signal['status'] = 'VALID';
 
@@ -216,7 +265,7 @@ export function validateSignal(signal: Signal, nowIso: string): Signal {
   } else if (!instrument) {
     issues.push({
       code: 'INSTRUMENTO_NAO_SUPORTADO',
-      message: `Instrumento ${signal.symbol} fora do escopo do MVP (forex spot, pares major).`,
+      message: `Instrumento ${signal.symbol} fora do catalogo dos mercados suportados (Forex e Cripto).`,
       severity: 'BLOCK',
     });
     status = 'REJECTED';
@@ -227,6 +276,29 @@ export function validateSignal(signal: Signal, nowIso: string): Signal {
       severity: 'BLOCK',
     });
     status = 'REJECTED';
+  }
+
+  // --- Roteamento de mercado ------------------------------------------------
+  if (instrument) {
+    if (declaredMarketId && declaredMarketId !== instrument.marketId) {
+      issues.push({
+        code: 'MERCADO_DECLARADO_DIVERGE',
+        message: `Mensagem declarou ${MARKET_LABEL[declaredMarketId]}, porem ${instrument.symbol} pertence a ${MARKET_LABEL[instrument.marketId]}. Vale o instrumento.`,
+        severity: 'WARN',
+      });
+    }
+    if (source && !source.markets.includes(instrument.marketId)) {
+      const cadastro =
+        source.markets.length === 0
+          ? 'nenhum mercado classificado'
+          : source.markets.map((m) => MARKET_LABEL[m]).join(' e ');
+      issues.push({
+        code: 'MERCADO_NAO_CADASTRADO',
+        message: `A fonte esta cadastrada para ${cadastro} e este sinal e de ${MARKET_LABEL[instrument.marketId]} (${PRODUCT_LABEL[instrument.productType]}). O sinal fica registrado, porem fora da convergencia.`,
+        severity: 'BLOCK',
+      });
+      status = 'MARKET_MISMATCH';
+    }
   }
 
   if (!signal.side) {
@@ -247,11 +319,17 @@ export function validateSignal(signal: Signal, nowIso: string): Signal {
   }
 
   if (instrument && signal.entryPrice != null) {
-    const drift = Math.abs(signal.entryPrice - instrument.referencePrice) / instrument.referencePrice;
+    // Preco de referencia externo vence o valor inicial do catalogo, quando existe.
+    const reference =
+      liveReferencePrice != null && liveReferencePrice > 0
+        ? liveReferencePrice
+        : instrument.referencePrice;
+    const origem = liveReferencePrice != null && liveReferencePrice > 0 ? 'referencia externa' : 'catalogo';
+    const drift = Math.abs(signal.entryPrice - reference) / reference;
     if (drift > 0.2) {
       issues.push({
         code: 'PRECO_IMPLAUSIVEL',
-        message: `Preco de entrada ${signal.entryPrice} distante mais de 20% da referencia do instrumento.`,
+        message: `Preco de entrada ${signal.entryPrice} distante mais de 20% da referencia (${reference}, ${origem}).`,
         severity: 'BLOCK',
       });
       status = 'REJECTED';
@@ -357,7 +435,13 @@ export function ingest(input: SignalInput, ctx: IngestContext): IngestOutcome {
     if (!target) {
       return {
         kind: 'REJECTED',
-        signal: validateSignal(normalize(input, ctx), ctx.nowIso),
+        signal: validateSignal(
+          normalize(input, ctx),
+          ctx.nowIso,
+          ctx.source,
+          input.marketId ?? null,
+          ctx.referencePriceOf?.(input.symbol ?? '') ?? null,
+        ),
         reason: `Cancelamento sem sinal correspondente (mensagem ${externalId ?? 'sem id'}).`,
       };
     }
@@ -383,6 +467,9 @@ export function ingest(input: SignalInput, ctx: IngestContext): IngestOutcome {
       const edited = validateSignal(
         { ...draft, version: prior.version + 1, supersedesSignalId: prior.id },
         ctx.nowIso,
+        ctx.source,
+        input.marketId ?? null,
+        ctx.referencePriceOf?.(input.symbol ?? '') ?? null,
       );
       return { kind: 'ACCEPTED', signal: edited, supersededId: prior.id };
     }
@@ -406,7 +493,13 @@ export function ingest(input: SignalInput, ctx: IngestContext): IngestOutcome {
     }
   }
 
-  const validated = validateSignal(draft, ctx.nowIso);
+  const validated = validateSignal(
+    draft,
+    ctx.nowIso,
+    ctx.source,
+    input.marketId ?? null,
+    ctx.referencePriceOf?.(input.symbol ?? '') ?? null,
+  );
   if (validated.status === 'REJECTED') {
     return {
       kind: 'REJECTED',
@@ -436,7 +529,12 @@ export function refreshSignalStatus(
   nowIso: string,
   maxAgeMinutes: number,
 ): Signal {
-  if (signal.status === 'CANCELLED' || signal.status === 'SUPERSEDED' || signal.status === 'REJECTED') {
+  if (
+    signal.status === 'CANCELLED' ||
+    signal.status === 'SUPERSEDED' ||
+    signal.status === 'REJECTED' ||
+    signal.status === 'MARKET_MISMATCH'
+  ) {
     return signal;
   }
   const ageMin = minutesBetween(signal.receivedAt, nowIso);

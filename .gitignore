@@ -2,5 +2,13 @@ node_modules/
 dist/
 *.log
 .env
-.env.local
+.env.*
+!.env.example
 data/
+data.bak-*/
+
+# Sessao autenticada do Telegram e qualquer arquivo de sessao MTProto.
+*.session
+*.session-journal
+telegram-session*
+server/data/

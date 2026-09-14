@@ -1,16 +1,19 @@
 import {
   notionalValue,
-  pipValueUsd,
+  pipSizeFor,
+  pipValue,
   pipsToPrice,
   requireInstrument,
   requiredMargin,
-  roundLots,
   roundPrice,
+  roundQuantity,
 } from './instruments.ts';
 import { minutesBetween, minutesOfDay, parseHhMm, secondsBetween, zonedParts } from './time.ts';
 import type {
   AccountSnapshot,
   CriterionCheck,
+  GlobalRiskSettings,
+  MarketId,
   OperationMode,
   Opportunity,
   Position,
@@ -21,47 +24,75 @@ import type {
   Side,
   SizingResult,
 } from './types.ts';
+import { MARKET_LABEL } from './types.ts';
 
 /**
  * Motor de risco e dimensionamento.
  *
- * Ordem dos portoes e proposital: primeiro integridade de dados e conexao, depois
- * limites do dia, depois limites estruturais, e por fim condicoes de mercado.
+ * Avalia SEMPRE no contexto de um mercado, e sempre com os limites globais por
+ * cima. Ordem dos portoes: integridade de dados e conexao, suporte do instrumento,
+ * limites do dia do mercado, limites estruturais do mercado, limites globais e por
+ * fim condicoes de mercado e dimensionamento.
+ *
  * Todos os portoes sao avaliados mesmo quando ja houve bloqueio, para que a
  * interface mostre a lista completa de motivos em vez de apenas o primeiro.
  *
- * Nenhum modo operacional ignora estes portoes. "Executar sempre que convergir"
- * significa dispensar a confirmacao manual, nao dispensar limites de risco.
+ * Nenhum modo operacional ignora estes portoes, e nenhum mercado ignora um limite
+ * global. "Executar sempre que convergir" dispensa a confirmacao manual, nao os
+ * limites de risco.
  */
 
 export interface DayState {
   /** Chave do dia operacional no fuso configurado. */
   dayKey: string;
-  /** Patrimonio na abertura do dia operacional, sem depositos e saques. */
+  /** Patrimonio da conta do mercado na abertura do dia, sem depositos e saques. */
   baseEquity: number;
-  /** Resultado liquido realizado no dia (posicoes fechadas, ja com custos). */
+  /** Resultado liquido realizado no dia, neste mercado. */
   realizedNetPnl: number;
-  /** Custos acumulados no dia. */
   costs: number;
-  /** Depositos e saques do dia, contabilizados a parte do resultado. */
   cashFlows: number;
   tradesToday: number;
   lastEntryAt: string | null;
   consecutiveLosses: number;
   pausedUntil: string | null;
-  /** Registrado quando um limite diario foi atingido. */
   dailyLimitHit: 'LOSS' | 'PROFIT' | null;
+}
+
+/** Estado diario consolidado dos dois mercados, na moeda de referencia. */
+export interface GlobalDayState {
+  dayKey: string;
+  baseEquity: number;
+  realizedNetPnl: number;
+  tradesToday: number;
+  dailyLimitHit: 'LOSS' | 'PROFIT' | null;
+  /** Descreve a conversao usada para consolidar contas de moedas diferentes. */
+  conversionNote: string;
 }
 
 export interface RiskContext {
   nowIso: string;
+  marketId: MarketId;
+  /** Quem pediu o envio. Automacao desligada nao impede confirmacao manual. */
+  origin: 'AUTO' | 'MANUAL';
   mode: OperationMode;
-  automationPaused: boolean;
+  /** Automacao deste mercado. */
+  automationEnabled: boolean;
+  /** Pausa global de novas entradas automaticas nos dois mercados. */
+  globalPaused: boolean;
   settings: RiskSettings;
+  globalSettings: GlobalRiskSettings;
   account: AccountSnapshot;
   quote: Quote | null;
+  /** Posicoes abertas DESTE mercado. */
   openPositions: Position[];
+  /** Posicoes abertas dos dois mercados, ja convertidas para a moeda de referencia. */
+  allOpenPositions: Position[];
+  /** Exposicao total dos dois mercados, na moeda de referencia. */
+  globalExposureNotional: number;
   day: DayState;
+  globalDay: GlobalDayState;
+  /** A conta escolhida para este mercado negocia este instrumento? */
+  accountSupportsSymbol: boolean;
   /** Execucoes ja disparadas por esta oportunidade. */
   executionsForOpportunity: number;
 }
@@ -87,7 +118,8 @@ export interface DailyResult {
 export function computeDailyResult(
   day: DayState,
   openPositions: Position[],
-  settings: RiskSettings,
+  lossLimitPercent: number,
+  profitTargetPercent: number,
 ): DailyResult {
   const unrealizedPnl = openPositions.reduce((s, p) => s + p.netPnl, 0);
   const limitBasisPnl = day.realizedNetPnl;
@@ -103,8 +135,8 @@ export function computeDailyResult(
     limitBasisPercent: (limitBasisPnl / base) * 100,
     totalWithOpenPnl: limitBasisPnl + unrealizedPnl,
     totalWithOpenPercent: ((limitBasisPnl + unrealizedPnl) / base) * 100,
-    lossLimitValue: -(base * settings.dailyLossLimitPercent) / 100,
-    profitTargetValue: (base * settings.dailyProfitTargetPercent) / 100,
+    lossLimitValue: -(base * lossLimitPercent) / 100,
+    profitTargetValue: (base * profitTargetPercent) / 100,
   };
 }
 
@@ -125,43 +157,46 @@ export function computeSizing(
 
   let stopPrice: number | null = settings.useSignalStops ? signalStopLoss : null;
   if (stopPrice == null) {
-    const dist = pipsToPrice(instrument, settings.defaultStopPips);
+    const dist = pipsToPrice(instrument, settings.defaultStopPips, entryPrice);
     stopPrice = side === 'BUY' ? entryPrice - dist : entryPrice + dist;
   }
   let tpPrice: number | null = settings.useSignalStops ? signalTakeProfit : null;
   if (tpPrice == null) {
-    const dist = pipsToPrice(instrument, settings.defaultTakeProfitPips);
+    const dist = pipsToPrice(instrument, settings.defaultTakeProfitPips, entryPrice);
     tpPrice = side === 'BUY' ? entryPrice + dist : entryPrice - dist;
   }
 
-  const stopPips = Math.abs(entryPrice - stopPrice) / instrument.pipSize;
-  const takeProfitPips = Math.abs(tpPrice - entryPrice) / instrument.pipSize;
+  const pip = pipSizeFor(instrument, entryPrice);
+  const stopPips = Math.abs(entryPrice - stopPrice) / pip;
+  const takeProfitPips = Math.abs(tpPrice - entryPrice) / pip;
 
-  let lots: number;
+  let quantity: number;
   let explanation: string;
 
-  if (settings.sizingMode === 'FIXED_LOTS') {
-    lots = settings.fixedLots;
-    explanation = `Lote fixo de ${lots} definido na configuracao.`;
+  if (settings.sizingMode === 'FIXED_QUANTITY') {
+    quantity = settings.fixedQuantity;
+    explanation = `Quantidade fixa de ${quantity} ${instrument.quantityLabel} definida na configuracao de ${MARKET_LABEL[instrument.marketId]}.`;
   } else {
     const riskBudget = (account.equity * settings.riskPercentPerTrade) / 100;
-    const perLotRisk = pipValueUsd(instrument, 1) * stopPips;
-    lots = perLotRisk > 0 ? riskBudget / perLotRisk : 0;
+    const perUnitRisk = pipValue(instrument, 1, entryPrice) * stopPips;
+    quantity = perUnitRisk > 0 ? riskBudget / perUnitRisk : 0;
     explanation =
       `Risco de ${settings.riskPercentPerTrade}% sobre patrimonio de ${account.currency} ${account.equity.toFixed(2)} ` +
       `= ${account.currency} ${riskBudget.toFixed(2)}. Stop de ${stopPips.toFixed(1)} pips a ` +
-      `${account.currency} ${pipValueUsd(instrument, 1).toFixed(2)} por pip por lote resulta em ${lots.toFixed(3)} lote(s).`;
+      `${account.currency} ${pipValue(instrument, 1, entryPrice).toFixed(4)} por pip por ${instrument.quantityLabel} ` +
+      `resulta em ${quantity.toFixed(6)} ${instrument.quantityLabel}.`;
   }
 
-  lots = roundLots(instrument, Math.min(Math.max(lots, 0), instrument.maxLots));
-  if (lots < instrument.minLots) lots = 0;
+  quantity = roundQuantity(instrument, Math.min(Math.max(quantity, 0), instrument.maxQuantity));
+  if (quantity < instrument.minQuantity) quantity = 0;
 
-  const notional = notionalValue(instrument, lots, entryPrice);
-  const risked = pipValueUsd(instrument, lots) * stopPips;
+  const notional = notionalValue(instrument, quantity, entryPrice);
+  const risked = pipValue(instrument, quantity, entryPrice) * stopPips;
 
   return {
     mode: settings.sizingMode,
-    lots,
+    quantity,
+    quantityLabel: instrument.quantityLabel,
     notionalValue: Math.round(notional * 100) / 100,
     riskedValue: Math.round(risked * 100) / 100,
     stopPips: Math.round(stopPips * 10) / 10,
@@ -177,43 +212,94 @@ export function computeSizing(
 // ---------------------------------------------------------------------------
 
 export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDecision {
-  const { settings, account, quote, openPositions, day, nowIso } = ctx;
+  const { settings, globalSettings, account, quote, openPositions, day, globalDay, nowIso } = ctx;
   const blocks: RiskBlock[] = [];
   const warnings: RiskBlock[] = [];
   const checks: CriterionCheck[] = [];
+  const marketLabel = MARKET_LABEL[ctx.marketId];
 
-  const add = (passed: boolean, code: string, label: string, detail: string, hard = true) => {
+  const add = (
+    passed: boolean,
+    code: string,
+    label: string,
+    detail: string,
+    scope: 'MARKET' | 'GLOBAL' = 'MARKET',
+    hard = true,
+  ) => {
     checks.push({ code, label, passed, detail });
-    if (!passed) (hard ? blocks : warnings).push({ code, label, detail });
+    if (!passed) (hard ? blocks : warnings).push({ code, label, detail, scope });
   };
 
   const instrument = requireInstrument(opportunity.symbol);
 
-  // --- Modo operacional ------------------------------------------------------
+  // --- Modo operacional e automacao -----------------------------------------
   add(
     ctx.mode !== 'OBSERVE',
     'MODO_OBSERVACAO',
-    'Modo operacional permite envio',
+    `Modo operacional de ${marketLabel} permite envio`,
     ctx.mode === 'OBSERVE'
-      ? 'Modo Observacao: oportunidades sao publicadas, nenhuma ordem e enviada.'
-      : `Modo ${ctx.mode === 'AUTO' ? 'Autonomo' : 'Semiautomatico'} ativo.`,
+      ? `Modo Observacao em ${marketLabel}: oportunidades sao publicadas, nenhuma ordem e enviada.`
+      : `Modo ${ctx.mode === 'AUTO' ? 'Autonomo' : 'Semiautomatico'} ativo em ${marketLabel}.`,
   );
 
-  add(
-    !ctx.automationPaused,
-    'AUTOMACAO_PAUSADA',
-    'Automacao ativa',
-    ctx.automationPaused ? 'Automacao pausada manualmente pelo usuario.' : 'Automacao nao esta pausada.',
-  );
+  /*
+   * Automacao e pausa global travam apenas o envio AUTOMATICO. Confirmacao manual
+   * continua valendo: desligar a automacao nao e o mesmo que proibir o operador.
+   */
+  if (ctx.origin === 'AUTO') {
+    add(
+      ctx.automationEnabled,
+      'AUTOMACAO_MERCADO_DESLIGADA',
+      `Automacao de ${marketLabel} ligada`,
+      ctx.automationEnabled
+        ? `Automacao de ${marketLabel} ligada.`
+        : `Automacao de ${marketLabel} desligada. Sinais continuam chegando, oportunidades continuam aparecendo e as posicoes abertas seguem sendo geridas.`,
+    );
+    add(
+      !ctx.globalPaused,
+      'PAUSA_GLOBAL',
+      'Pausa global inativa',
+      ctx.globalPaused
+        ? 'Pausa global ativa: novas entradas automaticas bloqueadas nos dois mercados.'
+        : 'Nenhuma pausa global ativa.',
+      'GLOBAL',
+    );
+  } else {
+    if (!ctx.automationEnabled) {
+      warnings.push({
+        code: 'AUTOMACAO_MERCADO_DESLIGADA',
+        label: `Automacao de ${marketLabel} desligada`,
+        detail: 'Esta ordem sai por confirmacao manual, nao pela automacao.',
+        scope: 'MARKET',
+      });
+    }
+    if (ctx.globalPaused) {
+      warnings.push({
+        code: 'PAUSA_GLOBAL',
+        label: 'Pausa global ativa',
+        detail: 'A pausa global impede envios automaticos. Esta ordem e manual.',
+        scope: 'GLOBAL',
+      });
+    }
+  }
 
   // --- Integridade de dados e conexao ---------------------------------------
   add(
     account.connected,
     'SEM_CONEXAO',
-    'Corretora conectada',
+    'Conexao do mercado ativa',
     account.connected
-      ? `Conexao ativa com ${account.brokerId}.`
-      : 'Sem conexao com a corretora. Nenhuma ordem e enviada com dados indisponiveis.',
+      ? `Conexao ativa com ${account.brokerName} (conta ${account.accountId}).`
+      : `Sem conexao com a conta de ${marketLabel}. Nenhuma ordem e enviada com dados indisponiveis.`,
+  );
+
+  add(
+    ctx.accountSupportsSymbol,
+    'INSTRUMENTO_NAO_SUPORTADO',
+    'Conexao suporta o instrumento',
+    ctx.accountSupportsSymbol
+      ? `${account.brokerName} negocia ${opportunity.symbol}.`
+      : `${account.brokerName} nao negocia ${opportunity.symbol}. Uma conexao de um mercado nao opera o outro automaticamente.`,
   );
 
   const quoteAge = quote ? secondsBetween(quote.at, nowIso) : Number.POSITIVE_INFINITY;
@@ -245,62 +331,63 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
     `${ctx.executionsForOpportunity} de ${settings.maxExecutionsPerOpportunity} execucao(oes) usada(s). Atualizacoes da mesma convergencia nao geram entrada adicional.`,
   );
 
-  // --- Limites do dia --------------------------------------------------------
-  const daily = computeDailyResult(day, openPositions, settings);
-  const lossHit = daily.limitBasisPnl <= daily.lossLimitValue;
-  const profitHit = daily.limitBasisPnl >= daily.profitTargetValue;
+  // --- Limites do dia do mercado --------------------------------------------
+  const daily = computeDailyResult(
+    day,
+    openPositions,
+    settings.dailyLossLimitPercent,
+    settings.dailyProfitTargetPercent,
+  );
   add(
-    !lossHit,
+    daily.limitBasisPnl > daily.lossLimitValue,
     'STOP_DIARIO',
-    `Stop loss diario de ${settings.dailyLossLimitPercent}%`,
-    lossHit
-      ? `Resultado realizado ${daily.limitBasisPnl.toFixed(2)} atingiu o limite de ${daily.lossLimitValue.toFixed(2)}. Novas entradas bloqueadas ate a virada do dia.`
+    `Stop loss diario de ${marketLabel} (${settings.dailyLossLimitPercent}%)`,
+    daily.limitBasisPnl <= daily.lossLimitValue
+      ? `Resultado realizado de ${marketLabel} ${daily.limitBasisPnl.toFixed(2)} atingiu o limite de ${daily.lossLimitValue.toFixed(2)}. Novas entradas deste mercado bloqueadas ate a virada do dia.`
       : `Resultado realizado ${daily.limitBasisPnl.toFixed(2)} de um limite de ${daily.lossLimitValue.toFixed(2)}.`,
   );
   add(
-    !profitHit,
+    daily.limitBasisPnl < daily.profitTargetValue,
     'STOP_WIN_DIARIO',
-    `Stop win diario de ${settings.dailyProfitTargetPercent}%`,
-    profitHit
-      ? `Meta diaria de ${daily.profitTargetValue.toFixed(2)} atingida. Novas entradas bloqueadas.`
+    `Stop win diario de ${marketLabel} (${settings.dailyProfitTargetPercent}%)`,
+    daily.limitBasisPnl >= daily.profitTargetValue
+      ? `Meta diaria de ${marketLabel} (${daily.profitTargetValue.toFixed(2)}) atingida. Novas entradas deste mercado bloqueadas.`
       : `Resultado realizado ${daily.limitBasisPnl.toFixed(2)} de uma meta de ${daily.profitTargetValue.toFixed(2)}.`,
   );
 
   add(
     day.tradesToday < settings.maxTradesPerDay,
     'LIMITE_OPERACOES_DIA',
-    `Maximo de ${settings.maxTradesPerDay} operacoes por dia`,
-    `${day.tradesToday} operacao(oes) abertas hoje (${day.dayKey}).`,
+    `Maximo de ${settings.maxTradesPerDay} operacoes por dia em ${marketLabel}`,
+    `${day.tradesToday} operacao(oes) abertas hoje em ${marketLabel} (${day.dayKey}).`,
   );
 
-  // --- Pausa por perdas consecutivas ----------------------------------------
   const paused = day.pausedUntil != null && Date.parse(day.pausedUntil) > Date.parse(nowIso);
   add(
     !paused,
     'PAUSA_POR_PERDAS',
     `Pausa apos ${settings.pauseAfterConsecutiveLosses} perdas consecutivas`,
     paused
-      ? `Em pausa ate ${day.pausedUntil} apos ${day.consecutiveLosses} perdas seguidas.`
-      : `${day.consecutiveLosses} perda(s) consecutiva(s).`,
+      ? `${marketLabel} em pausa ate ${day.pausedUntil} apos ${day.consecutiveLosses} perdas seguidas.`
+      : `${day.consecutiveLosses} perda(s) consecutiva(s) em ${marketLabel}.`,
   );
 
-  // --- Intervalo entre entradas ---------------------------------------------
-  const sinceLast = day.lastEntryAt == null ? Number.POSITIVE_INFINITY : minutesBetween(day.lastEntryAt, nowIso);
+  const sinceLast =
+    day.lastEntryAt == null ? Number.POSITIVE_INFINITY : minutesBetween(day.lastEntryAt, nowIso);
   add(
     sinceLast >= settings.minMinutesBetweenEntries,
     'INTERVALO_ENTRE_ENTRADAS',
-    `Intervalo minimo de ${settings.minMinutesBetweenEntries} min entre entradas`,
+    `Intervalo minimo de ${settings.minMinutesBetweenEntries} min entre entradas de ${marketLabel}`,
     day.lastEntryAt == null
-      ? 'Nenhuma entrada anterior no dia.'
-      : `Ultima entrada ha ${sinceLast.toFixed(1)} min.`,
+      ? `Nenhuma entrada anterior em ${marketLabel} hoje.`
+      : `Ultima entrada de ${marketLabel} ha ${sinceLast.toFixed(1)} min.`,
   );
 
-  // --- Posicoes e exposicao --------------------------------------------------
   add(
     openPositions.length < settings.maxOpenPositions,
     'MAX_POSICOES',
-    `Maximo de ${settings.maxOpenPositions} operacao(oes) aberta(s)`,
-    `${openPositions.length} posicao(oes) aberta(s).`,
+    `Maximo de ${settings.maxOpenPositions} operacao(oes) aberta(s) em ${marketLabel}`,
+    `${openPositions.length} posicao(oes) aberta(s) em ${marketLabel}.`,
   );
 
   // --- Janela de horario -----------------------------------------------------
@@ -312,15 +399,16 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
     const end = parseHhMm(w.end);
     return start <= end ? nowMin >= start && nowMin <= end : nowMin >= start || nowMin <= end;
   });
+  const hhmm = `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
   add(
     dayAllowed && windowAllowed,
     'FORA_DE_HORARIO',
-    'Dentro do horario permitido',
+    `Dentro do horario permitido de ${marketLabel}`,
     !dayAllowed
-      ? `Dia da semana ${parts.weekday} fora dos dias permitidos (forex spot nao negocia no fim de semana).`
+      ? `Dia da semana ${parts.weekday} fora dos dias permitidos de ${marketLabel}${instrument.tradesAllWeek ? '.' : ' (mercado fechado no fim de semana).'}`
       : windowAllowed
-        ? `Horario ${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')} (${settings.tradingTimezone}) dentro das faixas configuradas.`
-        : `Horario ${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')} (${settings.tradingTimezone}) fora das faixas configuradas.`,
+        ? `Horario ${hhmm} (${settings.tradingTimezone}) dentro das faixas configuradas.`
+        : `Horario ${hhmm} (${settings.tradingTimezone}) fora das faixas configuradas de ${marketLabel}.`,
   );
 
   // --- Condicoes de mercado --------------------------------------------------
@@ -335,7 +423,8 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
 
   const marketPrice = quote ? (opportunity.side === 'BUY' ? quote.ask : quote.bid) : null;
   if (quote && marketPrice != null && opportunity.referenceEntry != null) {
-    const deviationPips = Math.abs(marketPrice - opportunity.referenceEntry) / instrument.pipSize;
+    const deviationPips =
+      Math.abs(marketPrice - opportunity.referenceEntry) / pipSizeFor(instrument, marketPrice);
     add(
       deviationPips <= settings.maxPriceDeviationPips,
       'DESVIO_DE_PRECO',
@@ -344,7 +433,7 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
     );
   }
 
-  // --- Dimensionamento -------------------------------------------------------
+  // --- Dimensionamento e exposicao -------------------------------------------
   let sizing: SizingResult | null = null;
   if (marketPrice != null) {
     sizing = computeSizing(
@@ -358,12 +447,21 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
     );
 
     add(
-      sizing.lots >= instrument.minLots,
-      'VOLUME_INVALIDO',
-      'Volume calculado utilizavel',
-      sizing.lots < instrument.minLots
-        ? `Volume calculado ${sizing.lots} abaixo do lote minimo ${instrument.minLots} do instrumento.`
-        : `Volume ${sizing.lots} lote(s). Valor nocional ${account.currency} ${sizing.notionalValue.toFixed(2)}, valor arriscado ${account.currency} ${sizing.riskedValue.toFixed(2)}.`,
+      sizing.quantity >= instrument.minQuantity,
+      'QUANTIDADE_INVALIDA',
+      'Quantidade calculada utilizavel',
+      sizing.quantity < instrument.minQuantity
+        ? `Quantidade calculada ${sizing.quantity} abaixo do minimo ${instrument.minQuantity} ${instrument.quantityLabel} do instrumento.`
+        : `${sizing.quantity} ${instrument.quantityLabel}, passo ${instrument.quantityStep}. Valor nocional ${account.currency} ${sizing.notionalValue.toFixed(2)}, valor arriscado ${account.currency} ${sizing.riskedValue.toFixed(2)}.`,
+    );
+
+    add(
+      instrument.minNotional === 0 || sizing.notionalValue >= instrument.minNotional,
+      'NOCIONAL_MINIMO',
+      'Valor minimo da ordem atendido',
+      instrument.minNotional === 0
+        ? 'Instrumento sem valor minimo por ordem.'
+        : `Nocional ${sizing.notionalValue.toFixed(2)} contra minimo de ${instrument.minNotional} exigido pela venue.`,
     );
 
     const symbolExposure = openPositions
@@ -376,21 +474,64 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
       `Exposicao em ${opportunity.symbol}: ${symbolExposure.toFixed(0)} aberta + ${sizing.notionalValue.toFixed(0)} da nova ordem.`,
     );
 
-    const totalExposure = openPositions.reduce((s, p) => s + p.notionalValue, 0);
+    const marketExposure = openPositions.reduce((s, p) => s + p.notionalValue, 0);
     add(
-      totalExposure + sizing.notionalValue <= settings.maxTotalExposureNotional,
-      'EXPOSICAO_TOTAL',
-      `Exposicao maxima total de ${settings.maxTotalExposureNotional}`,
-      `Exposicao total: ${totalExposure.toFixed(0)} aberta + ${sizing.notionalValue.toFixed(0)} da nova ordem.`,
+      marketExposure + sizing.notionalValue <= settings.maxTotalExposureNotional,
+      'EXPOSICAO_MERCADO',
+      `Exposicao maxima de ${marketLabel} (${settings.maxTotalExposureNotional})`,
+      `Exposicao de ${marketLabel}: ${marketExposure.toFixed(0)} aberta + ${sizing.notionalValue.toFixed(0)} da nova ordem.`,
     );
 
-    const margin = requiredMargin(instrument, sizing.lots, marketPrice);
+    const margin = requiredMargin(instrument, sizing.quantity, marketPrice);
     add(
       margin <= account.freeMargin,
       'MARGEM_INSUFICIENTE',
       'Margem livre suficiente',
-      `Margem exigida ${account.currency} ${margin.toFixed(2)} contra margem livre ${account.currency} ${account.freeMargin.toFixed(2)}.`,
+      `Margem exigida ${account.currency} ${margin.toFixed(2)} contra margem livre ${account.currency} ${account.freeMargin.toFixed(2)}` +
+        (account.reservedMargin > 0
+          ? `, ja descontada a reserva de ${account.reservedMargin.toFixed(2)} de ordens em voo.`
+          : '.'),
     );
+
+    // --- Limites globais -----------------------------------------------------
+    if (globalSettings.enabled) {
+      add(
+        ctx.allOpenPositions.length < globalSettings.maxOpenPositionsTotal,
+        'MAX_POSICOES_GLOBAL',
+        `Maximo global de ${globalSettings.maxOpenPositionsTotal} operacao(oes) aberta(s)`,
+        `${ctx.allOpenPositions.length} posicao(oes) aberta(s) somando Forex e Cripto.`,
+        'GLOBAL',
+      );
+      add(
+        ctx.globalExposureNotional + sizing.notionalValue <= globalSettings.maxTotalExposureNotional,
+        'EXPOSICAO_GLOBAL',
+        `Exposicao global maxima de ${globalSettings.maxTotalExposureNotional} ${globalSettings.referenceCurrency}`,
+        `Exposicao somada: ${ctx.globalExposureNotional.toFixed(0)} aberta + ${sizing.notionalValue.toFixed(0)} da nova ordem. ${globalDay.conversionNote}`,
+        'GLOBAL',
+      );
+
+      const globalBase = globalDay.baseEquity || 1;
+      const globalLossLimit = -(globalBase * globalSettings.dailyLossLimitPercent) / 100;
+      const globalProfitTarget = (globalBase * globalSettings.dailyProfitTargetPercent) / 100;
+      add(
+        globalDay.realizedNetPnl > globalLossLimit,
+        'STOP_DIARIO_GLOBAL',
+        `Stop loss diario global (${globalSettings.dailyLossLimitPercent}%)`,
+        globalDay.realizedNetPnl <= globalLossLimit
+          ? `Resultado realizado consolidado ${globalDay.realizedNetPnl.toFixed(2)} atingiu o limite global de ${globalLossLimit.toFixed(2)}. Novas entradas bloqueadas nos DOIS mercados. ${globalDay.conversionNote}`
+          : `Resultado consolidado ${globalDay.realizedNetPnl.toFixed(2)} de um limite global de ${globalLossLimit.toFixed(2)}.`,
+        'GLOBAL',
+      );
+      add(
+        globalDay.realizedNetPnl < globalProfitTarget,
+        'STOP_WIN_DIARIO_GLOBAL',
+        `Stop win diario global (${globalSettings.dailyProfitTargetPercent}%)`,
+        globalDay.realizedNetPnl >= globalProfitTarget
+          ? `Meta global de ${globalProfitTarget.toFixed(2)} atingida. Novas entradas bloqueadas nos DOIS mercados.`
+          : `Resultado consolidado ${globalDay.realizedNetPnl.toFixed(2)} de uma meta global de ${globalProfitTarget.toFixed(2)}.`,
+        'GLOBAL',
+      );
+    }
   }
 
   if (settings.martingaleEnabled) {
@@ -399,6 +540,7 @@ export function evaluateRisk(opportunity: Opportunity, ctx: RiskContext): RiskDe
       label: 'Martingale ativo',
       detail:
         'Aumento de volume apos perdas esta habilitado. Concentra o risco de ruina em poucas sequencias adversas.',
+      scope: 'MARKET',
     });
   }
 

@@ -1,17 +1,17 @@
-import { INSTRUMENTS, getInstrument, pipsToPrice, roundPrice } from '../core/instruments.ts';
+import { getInstrument, instrumentsOfMarket, pipsToPrice, roundPrice } from '../core/instruments.ts';
 import { id } from '../core/ids.ts';
 import type { Engine } from '../engine/engine.ts';
-import type { Side } from '../core/types.ts';
+import type { MarketId, Side } from '../core/types.ts';
+import { MARKET_IDS } from '../core/types.ts';
 
 /**
  * Gerador de sinais para o prototipo.
  *
  * Produz mensagens com a mesma forma das que viriam de uma sala real: texto livre
- * mais campos normalizados. Serve para exercitar o motor; nao imita o comportamento
- * estatistico de nenhum provedor real.
+ * mais campos normalizados. Cada rodada acontece dentro de UM mercado, usando
+ * apenas as fontes cadastradas para ele. Nao imita o comportamento estatistico de
+ * nenhum provedor real.
  */
-
-const REGULAR = INSTRUMENTS.filter((i) => i.venue === 'REGULAR');
 
 function pick<T>(items: T[], rnd: () => number): T {
   const index = Math.floor(rnd() * items.length);
@@ -19,18 +19,18 @@ function pick<T>(items: T[], rnd: () => number): T {
 }
 
 export interface GeneratorConfig {
-  /** Intervalo medio entre rodadas de sinais, em segundos. */
   intervalSeconds: number;
-  /** Probabilidade de uma rodada gerar concordancia entre varias fontes. */
   agreementProbability: number;
-  /** Probabilidade de uma fonte discordar dentro de uma rodada concordante. */
   dissentProbability: number;
+  /** Mercados em que o gerador atua. */
+  markets: MarketId[];
 }
 
 export const defaultGeneratorConfig: GeneratorConfig = {
   intervalSeconds: 45,
   agreementProbability: 0.55,
   dissentProbability: 0.25,
+  markets: ['FOREX', 'CRYPTO'],
 };
 
 export class SignalGenerator {
@@ -40,7 +40,7 @@ export class SignalGenerator {
 
   constructor(engine: Engine, config: GeneratorConfig = defaultGeneratorConfig) {
     this.engine = engine;
-    this.config = { ...config };
+    this.config = { ...config, markets: [...config.markets] };
   }
 
   get running(): boolean {
@@ -49,15 +49,27 @@ export class SignalGenerator {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => this.round(), this.config.intervalSeconds * 1000);
-    this.engine.log('SCENARIO_RUN', 'INFO', 'Gerador de sinais iniciado', `Uma rodada a cada ${this.config.intervalSeconds} s.`);
+    this.timer = setInterval(() => this.roundAll(), this.config.intervalSeconds * 1000);
+    this.engine.log(
+      'SCENARIO_RUN',
+      'INFO',
+      null,
+      'Gerador de sinais iniciado',
+      `Uma rodada a cada ${this.config.intervalSeconds} s em ${this.config.markets.join(' e ')}.`,
+    );
   }
 
   stop(): void {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = null;
-    this.engine.log('SCENARIO_RUN', 'INFO', 'Gerador de sinais parado', 'Nenhuma mensagem sintetica sera criada.');
+    this.engine.log(
+      'SCENARIO_RUN',
+      'INFO',
+      null,
+      'Gerador de sinais parado',
+      'Nenhuma mensagem sintetica sera criada.',
+    );
   }
 
   setConfig(patch: Partial<GeneratorConfig>): void {
@@ -67,38 +79,62 @@ export class SignalGenerator {
     if (wasRunning) this.start();
   }
 
-  /** Uma rodada: escolhe instrumento e distribui sinais entre as fontes geradoras. */
-  round(): void {
+  roundAll(): void {
+    for (const marketId of MARKET_IDS) {
+      if (this.config.markets.includes(marketId)) this.round(marketId);
+    }
+  }
+
+  /** Uma rodada em um mercado: escolhe instrumento e distribui sinais entre as fontes. */
+  round(marketId: MarketId): void {
     const rnd = Math.random;
-    const generatorSources = this.engine.sources.filter((s) => s.kind === 'GENERATOR' && s.enabled);
+    const generatorSources = this.engine.sources.filter(
+      (s) => s.kind === 'GENERATOR' && s.enabled && s.markets.includes(marketId),
+    );
     if (generatorSources.length === 0) return;
 
-    const instrument = pick(REGULAR, rnd);
-    const quote = this.engine.broker.getQuote(instrument.symbol);
+    const pool = instrumentsOfMarket(marketId).filter((i) => i.venue === 'REGULAR');
+    if (pool.length === 0) return;
+    const instrument = pick(pool, rnd);
+
+    const broker = this.engine.brokerFor(marketId);
+    const quote = broker.getQuote(instrument.symbol);
     const mid = quote ? (quote.bid + quote.ask) / 2 : instrument.referencePrice;
 
     const agreeing = rnd() < this.config.agreementProbability;
     const baseSide: Side = rnd() < 0.5 ? 'BUY' : 'SELL';
     const timeframe = pick([5, 15, 15, 30, 60], rnd);
 
-    const participants = agreeing
-      ? generatorSources
-      : generatorSources.filter(() => rnd() < 0.5);
+    const participants = agreeing ? generatorSources : generatorSources.filter(() => rnd() < 0.5);
 
     for (const source of participants) {
       const dissent = agreeing && rnd() < this.config.dissentProbability;
-      const side: Side = agreeing ? (dissent ? (baseSide === 'BUY' ? 'SELL' : 'BUY') : baseSide) : rnd() < 0.5 ? 'BUY' : 'SELL';
-      const jitterPips = (rnd() - 0.5) * 8;
-      const entry = roundPrice(instrument, mid + pipsToPrice(instrument, jitterPips));
-      const stopPips = 15 + Math.floor(rnd() * 20);
+      const side: Side = agreeing
+        ? dissent
+          ? baseSide === 'BUY'
+            ? 'SELL'
+            : 'BUY'
+          : baseSide
+        : rnd() < 0.5
+          ? 'BUY'
+          : 'SELL';
+      // Dispersao proporcional a tolerancia do mercado.
+      const spread = this.engine.markets[marketId].convergence.entryTolerancePips;
+      const jitterPips = (rnd() - 0.5) * spread;
+      const entry = roundPrice(instrument, mid + pipsToPrice(instrument, jitterPips, mid));
+      const stopPips = this.engine.markets[marketId].risk.defaultStopPips * (0.75 + rnd() * 0.5);
       const tpPips = stopPips * (1.2 + rnd());
       const stopLoss = roundPrice(
         instrument,
-        side === 'BUY' ? entry - pipsToPrice(instrument, stopPips) : entry + pipsToPrice(instrument, stopPips),
+        side === 'BUY'
+          ? entry - pipsToPrice(instrument, stopPips, mid)
+          : entry + pipsToPrice(instrument, stopPips, mid),
       );
       const takeProfit = roundPrice(
         instrument,
-        side === 'BUY' ? entry + pipsToPrice(instrument, tpPips) : entry - pipsToPrice(instrument, tpPips),
+        side === 'BUY'
+          ? entry + pipsToPrice(instrument, tpPips, mid)
+          : entry - pipsToPrice(instrument, tpPips, mid),
       );
 
       const text =
@@ -109,6 +145,7 @@ export class SignalGenerator {
         sourceId: source.id,
         raw: { text, externalMessageId: id('msg') },
         parsedBy: 'GENERATOR',
+        marketId,
         symbol: instrument.symbol,
         venue: instrument.venue,
         side,
@@ -137,27 +174,30 @@ export class SignalGenerator {
   }): { ok: boolean; message: string; signalId?: string } {
     const instrument = getInstrument(params.symbol);
     if (!instrument) return { ok: false, message: 'Instrumento desconhecido.' };
-    const quote = this.engine.broker.getQuote(instrument.symbol);
+    const marketId = instrument.marketId;
+    const broker = this.engine.brokerFor(marketId);
+    const quote = broker.getQuote(instrument.symbol);
     const mid = quote ? (quote.bid + quote.ask) / 2 : instrument.referencePrice;
-    const entry = roundPrice(instrument, mid + pipsToPrice(instrument, params.entryOffsetPips ?? 0));
+    const entry = roundPrice(instrument, mid + pipsToPrice(instrument, params.entryOffsetPips ?? 0, mid));
     const timeframe = params.timeframeMinutes ?? 15;
-    const stopPips = 20;
-    const tpPips = 30;
+    const risk = this.engine.markets[marketId].risk;
+    const stopPips = risk.defaultStopPips;
+    const tpPips = risk.defaultTakeProfitPips;
     const withStops = params.withStops ?? true;
     const stopLoss = withStops
       ? roundPrice(
           instrument,
           params.side === 'BUY'
-            ? entry - pipsToPrice(instrument, stopPips)
-            : entry + pipsToPrice(instrument, stopPips),
+            ? entry - pipsToPrice(instrument, stopPips, mid)
+            : entry + pipsToPrice(instrument, stopPips, mid),
         )
       : null;
     const takeProfit = withStops
       ? roundPrice(
           instrument,
           params.side === 'BUY'
-            ? entry + pipsToPrice(instrument, tpPips)
-            : entry - pipsToPrice(instrument, tpPips),
+            ? entry + pipsToPrice(instrument, tpPips, mid)
+            : entry - pipsToPrice(instrument, tpPips, mid),
         )
       : null;
 
@@ -168,6 +208,7 @@ export class SignalGenerator {
         externalMessageId: params.externalMessageId ?? id('msg'),
       },
       parsedBy: 'GENERATOR',
+      marketId,
       symbol: instrument.symbol,
       venue: instrument.venue,
       side: params.side,
@@ -175,7 +216,9 @@ export class SignalGenerator {
       timeframeMinutes: timeframe,
       horizonMinutes: params.horizonMinutes ?? timeframe * 4,
       validUntil: params.validUntilMinutes
-        ? new Date(Date.parse(this.engine.clock.nowIso()) + params.validUntilMinutes * 60_000).toISOString()
+        ? new Date(
+            Date.parse(this.engine.clock.nowIso()) + params.validUntilMinutes * 60_000,
+          ).toISOString()
         : null,
       entryType: 'LIMIT',
       entryPrice: entry,

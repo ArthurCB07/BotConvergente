@@ -1,5 +1,15 @@
-import { api, type Snapshot } from '../api.ts';
-import { Badge, Card, Empty, SIDE_LABEL, clock, dateTime, money, signed } from '../components/ui.tsx';
+import { MARKET_LABEL, api, type MarketSlice } from '../api.ts';
+import {
+  Badge,
+  Card,
+  Empty,
+  MarketChip,
+  SIDE_LABEL,
+  clock,
+  dateTime,
+  money,
+  signed,
+} from '../components/ui.tsx';
 
 const ORDER_TONE: Record<string, 'ok' | 'block' | 'watch' | 'risk' | 'neutral'> = {
   FILLED: 'ok',
@@ -11,8 +21,10 @@ const ORDER_TONE: Record<string, 'ok' | 'block' | 'watch' | 'risk' | 'neutral'> 
   CANCELLED: 'neutral',
 };
 
-export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
-  const closed = snapshot.positions.filter((p: any) => p.status === 'CLOSED');
+export function Operacoes({ market }: { market: MarketSlice }) {
+  const marketId = market.marketId;
+  const currency = market.account.currency;
+  const closed = market.positions.filter((p: any) => p.status === 'CLOSED');
   const totals = closed.reduce(
     (acc: any, p: any) => ({
       gross: acc.gross + p.grossPnl,
@@ -26,43 +38,56 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
     <div className="page">
       <header className="page-head">
         <div>
-          <div className="eyebrow">Operacoes</div>
+          <div className="eyebrow">Operacoes · {MARKET_LABEL[marketId]}</div>
           <h1>Ordens, posicoes e historico</h1>
         </div>
-        <Badge tone="watch">todas simuladas</Badge>
+        <div className="row">
+          <MarketChip marketId={marketId} />
+          <Badge tone="watch">todas simuladas</Badge>
+          <Badge tone="neutral">conta {market.account.accountId}</Badge>
+        </div>
       </header>
 
       <div className="grid grid-4">
         <Card title="Resultado bruto">
-          <div className={`figure ${totals.gross >= 0 ? 'gain' : 'loss'}`}>{signed(totals.gross)}</div>
-          <p className="tiny dim">Antes de custos, sobre operacoes fechadas.</p>
+          <div className={`figure ${totals.gross >= 0 ? 'gain' : 'loss'}`}>
+            {signed(totals.gross, currency)}
+          </div>
+          <p className="tiny dim">Antes de custos, sobre operacoes fechadas deste mercado.</p>
         </Card>
         <Card title="Custos">
-          <div className="figure">{money(totals.costs)}</div>
-          <p className="tiny dim">Comissao simulada de USD 7 por lote, ida e volta.</p>
+          <div className="figure">{money(totals.costs, currency)}</div>
+          <p className="tiny dim">
+            {marketId === 'FOREX'
+              ? 'Comissao simulada de USD 7 por lote, ida e volta.'
+              : 'Taxa simulada de 0,1% do nocional por lado.'}
+          </p>
         </Card>
         <Card title="Resultado liquido">
-          <div className={`figure ${totals.net >= 0 ? 'gain' : 'loss'}`}>{signed(totals.net)}</div>
+          <div className={`figure ${totals.net >= 0 ? 'gain' : 'loss'}`}>
+            {signed(totals.net, currency)}
+          </div>
           <p className="tiny dim">Bruto menos custos. O spread ja esta no preco de entrada.</p>
         </Card>
         <Card title="Operacoes">
           <div className="figure">{closed.length}</div>
-          <p className="tiny dim">{snapshot.openPositions.length} aberta(s) agora.</p>
+          <p className="tiny dim">{market.openPositions.length} aberta(s) agora.</p>
         </Card>
       </div>
 
       <Card title="Posicoes abertas" tight>
-        {snapshot.openPositions.length === 0 ? (
-          <Empty>Nenhuma posicao aberta.</Empty>
+        {market.openPositions.length === 0 ? (
+          <Empty>Nenhuma posicao aberta neste mercado.</Empty>
         ) : (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Abertura</th>
+                  <th>Mercado</th>
                   <th>Ativo</th>
                   <th>Direcao</th>
-                  <th className="num">Lotes</th>
+                  <th className="num">Quantidade</th>
                   <th className="num">Preco</th>
                   <th className="num">Stop</th>
                   <th className="num">Alvo</th>
@@ -73,20 +98,27 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
                 </tr>
               </thead>
               <tbody>
-                {snapshot.openPositions.map((p: any) => (
+                {market.openPositions.map((p: any) => (
                   <tr key={p.id}>
                     <td className="num small">{clock(p.openedAt)}</td>
+                    <td>
+                      <MarketChip marketId={p.marketId} />
+                    </td>
                     <td className="num">{p.symbol}</td>
                     <td>
                       <Badge tone={p.side === 'BUY' ? 'long' : 'short'}>{SIDE_LABEL[p.side]}</Badge>
                     </td>
-                    <td className="num">{p.lots}</td>
+                    <td className="num">
+                      {p.quantity} {p.quantityLabel}
+                    </td>
                     <td className="num">{p.openPrice}</td>
                     <td className="num">{p.stopLoss ?? '—'}</td>
                     <td className="num">{p.takeProfit ?? '—'}</td>
-                    <td className="num">{money(p.notionalValue)}</td>
-                    <td className="num">{money(p.riskedValue)}</td>
-                    <td className={`num ${p.netPnl >= 0 ? 'gain' : 'loss'}`}>{signed(p.netPnl)}</td>
+                    <td className="num">{money(p.notionalValue, currency)}</td>
+                    <td className="num">{money(p.riskedValue, currency)}</td>
+                    <td className={`num ${p.netPnl >= 0 ? 'gain' : 'loss'}`}>
+                      {signed(p.netPnl, currency)}
+                    </td>
                     <td>
                       <button className="btn btn-sm" onClick={() => void api.closePosition(p.id)}>
                         Encerrar
@@ -101,38 +133,47 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
       </Card>
 
       <Card title="Ordens" tight>
-        {snapshot.orders.length === 0 ? (
-          <Empty>Nenhuma ordem enviada.</Empty>
+        {market.orders.length === 0 ? (
+          <Empty>Nenhuma ordem enviada neste mercado.</Empty>
         ) : (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Enviada</th>
+                  <th>Mercado</th>
+                  <th>Conta</th>
                   <th>Ativo</th>
                   <th>Direcao</th>
-                  <th className="num">Lotes</th>
+                  <th className="num">Quantidade</th>
                   <th className="num">Preenchimento</th>
                   <th>Situacao</th>
                   <th>Chave de cliente</th>
-                  <th>Observacao</th>
+                  <th>Oportunidade</th>
                 </tr>
               </thead>
               <tbody>
-                {snapshot.orders.map((o: any) => (
+                {market.orders.map((o: any) => (
                   <tr key={o.id}>
                     <td className="num small">{clock(o.createdAt)}</td>
+                    <td>
+                      <MarketChip marketId={o.marketId} />
+                    </td>
+                    <td className="tiny num dim">{o.accountId}</td>
                     <td className="num">{o.symbol}</td>
                     <td>
                       <Badge tone={o.side === 'BUY' ? 'long' : 'short'}>{SIDE_LABEL[o.side]}</Badge>
                     </td>
-                    <td className="num">{o.lots}</td>
+                    <td className="num">
+                      {o.quantity} {o.quantityLabel}
+                    </td>
                     <td className="num">{o.filledPrice ?? '—'}</td>
                     <td>
                       <Badge tone={ORDER_TONE[o.status] ?? 'neutral'}>{o.status}</Badge>
+                      {o.message && <div className="tiny dim">{o.message}</div>}
                     </td>
                     <td className="tiny num dim">{o.clientOrderId}</td>
-                    <td className="small dim">{o.message ?? '—'}</td>
+                    <td className="tiny num dim">{o.opportunityId ?? '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -141,14 +182,14 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
         )}
         <p className="tiny dim" style={{ padding: '10px 14px' }}>
           A chave de cliente e deterministica por oportunidade e tentativa. Se uma requisicao expira
-          sem resposta, o sistema consulta o estado dessa chave antes de qualquer reenvio, para nao
-          abrir posicao duplicada.
+          sem resposta, o sistema consulta o estado dessa chave antes de qualquer reenvio. Cada ordem
+          registra mercado, conta e oportunidade de origem.
         </p>
       </Card>
 
       <Card title="Historico de operacoes" tight>
         {closed.length === 0 ? (
-          <Empty>Nenhuma operacao encerrada.</Empty>
+          <Empty>Nenhuma operacao encerrada neste mercado.</Empty>
         ) : (
           <div className="table-wrap">
             <table>
@@ -176,9 +217,13 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
                     <td className="num">{p.openPrice}</td>
                     <td className="num">{p.closePrice}</td>
                     <td className="small">{p.closeReason}</td>
-                    <td className={`num ${p.grossPnl >= 0 ? 'gain' : 'loss'}`}>{signed(p.grossPnl)}</td>
-                    <td className="num">{money(p.costs)}</td>
-                    <td className={`num ${p.netPnl >= 0 ? 'gain' : 'loss'}`}>{signed(p.netPnl)}</td>
+                    <td className={`num ${p.grossPnl >= 0 ? 'gain' : 'loss'}`}>
+                      {signed(p.grossPnl, currency)}
+                    </td>
+                    <td className="num">{money(p.costs, currency)}</td>
+                    <td className={`num ${p.netPnl >= 0 ? 'gain' : 'loss'}`}>
+                      {signed(p.netPnl, currency)}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -187,14 +232,19 @@ export function Operacoes({ snapshot }: { snapshot: Snapshot }) {
         )}
       </Card>
 
-      <Card title="Registro completo de decisoes" tight>
+      <Card title="Registro de decisoes" tight>
         <div className="log">
-          {snapshot.events.map((event: any) => (
+          {market.events.map((event: any) => (
             <div key={event.id} className="log-row">
               <span className="log-time">{clock(event.at)}</span>
               <span className={`log-bar log-${event.severity}`} />
               <span>
                 <span className="log-title">{event.title}</span>{' '}
+                {event.marketId ? (
+                  <MarketChip marketId={event.marketId} />
+                ) : (
+                  <Badge tone="watch">global</Badge>
+                )}{' '}
                 <span className="tiny dim num">{event.kind}</span>
                 <br />
                 <span className="log-detail small">{event.detail}</span>

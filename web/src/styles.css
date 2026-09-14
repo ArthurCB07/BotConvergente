@@ -43,6 +43,9 @@
   /* Texto sobre fundos solidos. Inverte junto com o tema. */
   --on-ink: #ffffff;
   --on-accent: #ffffff;
+  /* Identidade de cada mercado. Aplicada via data-market na raiz do app. */
+  --fx-accent: #1d5fa8;
+  --cx-accent: #6d4aa8;
   --row-hover: #fbfbf9;
   --hatch: #e6e6e0;
   --hatch-border: #b4b8ae;
@@ -98,6 +101,8 @@
 
     --on-ink: #14161a;
     --on-accent: #14161a;
+    --fx-accent: #6fa5e0;
+    --cx-accent: #a98ae0;
     --row-hover: #1f232a;
     --hatch: #2b2f37;
     --hatch-border: #4a5059;
@@ -135,6 +140,8 @@
 
   --on-ink: #14161a;
   --on-accent: #14161a;
+  --fx-accent: #6fa5e0;
+  --cx-accent: #a98ae0;
   --row-hover: #1f232a;
   --hatch: #2b2f37;
   --hatch-border: #4a5059;
@@ -278,7 +285,8 @@ p:last-child { margin-bottom: 0; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 118px;
+  /* Os rotulos carregam o nome do mercado, entao a celula precisa de folga. */
+  min-width: 152px;
   white-space: nowrap;
 }
 .strip-cell:last-child { border-right: 0; }
@@ -599,4 +607,75 @@ details > summary:focus-visible { outline: 2px solid var(--watch); }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+}
+
+
+/* --- Seletor de mercado --------------------------------------------------- */
+
+/*
+ * A cor do mercado ativo e a unica coisa que muda de identidade entre Forex e
+ * Cripto. Todo o resto do sistema visual continua igual, para que a troca de
+ * mercado seja obvia sem virar um tema novo.
+ */
+.app[data-market='FOREX'] { --market-accent: var(--fx-accent); }
+.app[data-market='CRYPTO'] { --market-accent: var(--cx-accent); }
+
+.market-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 22px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  flex-wrap: wrap;
+}
+
+.market-seg {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.market-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-weight: 600;
+  cursor: pointer;
+}
+.market-seg button:last-child { border-right: 0; }
+.market-seg button:hover { background: var(--surface-sunken); color: var(--ink); }
+.market-seg button[aria-pressed='true'] { color: var(--on-accent); }
+.market-seg button[aria-pressed='true'][data-market='FOREX'] { background: var(--fx-accent); }
+.market-seg button[aria-pressed='true'][data-market='CRYPTO'] { background: var(--cx-accent); }
+.market-seg .nav-count { color: inherit; opacity: 0.7; }
+
+.market-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--on-accent);
+  white-space: nowrap;
+}
+.market-chip[data-market='FOREX'] { background: var(--fx-accent); }
+.market-chip[data-market='CRYPTO'] { background: var(--cx-accent); }
+
+.page-head { border-left: 3px solid var(--market-accent); padding-left: 12px; }
+
+.scope-global {
+  border-left: 3px solid var(--watch);
 }

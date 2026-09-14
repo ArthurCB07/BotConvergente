@@ -10,9 +10,10 @@ const source: Source = {
   name: 'Sala Teste',
   kind: 'GENERATOR',
   enabled: true,
+  markets: ['FOREX'],
   tags: [],
   independenceGroupId: 'g1',
-  weight: 1,
+  weightByMarket: { FOREX: 1, CRYPTO: 1 },
   notes: '',
   createdAt: NOW,
   stats: { received: 0, valid: 0, rejected: 0, lastSignalAt: null },
@@ -150,6 +151,68 @@ test('idade maxima marca o sinal como expirado', () => {
   assert.equal(refreshed.status, 'EXPIRED');
 });
 
+test('sinal de mercado fora do cadastro da fonte fica MARKET_MISMATCH', () => {
+  const outcome = ingest(
+    {
+      sourceId: 'src1',
+      parsedBy: 'GENERATOR',
+      raw: { text: 'COMPRA BTCUSDT', externalMessageId: 'm-cripto' },
+      symbol: 'BTCUSDT',
+      venue: 'REGULAR',
+      side: 'BUY',
+      timeframeMinutes: 15,
+      horizonMinutes: 60,
+      entryType: 'LIMIT',
+      entryPrice: 72_500,
+      stopLoss: 71_400,
+      takeProfit: 74_300,
+    },
+    ctx(),
+  );
+  assert.equal(outcome.kind, 'ACCEPTED');
+  if (outcome.kind !== 'ACCEPTED') return;
+  assert.equal(outcome.signal.status, 'MARKET_MISMATCH');
+  assert.equal(outcome.signal.marketId, 'CRYPTO', 'o mercado vem do instrumento, nao do palpite');
+  assert.ok(outcome.signal.issues.some((i) => i.code === 'MERCADO_NAO_CADASTRADO'));
+});
+
+test('mercado do sinal sai do instrumento mesmo quando a origem declara outro', () => {
+  const cryptoSource = { ...source, markets: ['FOREX', 'CRYPTO'] as const };
+  const outcome = ingest(
+    {
+      sourceId: 'src1',
+      parsedBy: 'GENERATOR',
+      marketId: 'FOREX',
+      raw: { text: 'COMPRA ETHUSDT', externalMessageId: 'm-eth' },
+      symbol: 'ETHUSDT',
+      venue: 'REGULAR',
+      side: 'BUY',
+      timeframeMinutes: 15,
+      horizonMinutes: 60,
+      entryType: 'LIMIT',
+      entryPrice: 3_850,
+      stopLoss: 3_790,
+      takeProfit: 3_950,
+    },
+    { nowIso: NOW, source: { ...cryptoSource, markets: ['FOREX', 'CRYPTO'] }, existing: [], defaultTimezone: 'America/Sao_Paulo' },
+  );
+  assert.equal(outcome.kind, 'ACCEPTED');
+  if (outcome.kind !== 'ACCEPTED') return;
+  assert.equal(outcome.signal.marketId, 'CRYPTO');
+  assert.equal(outcome.signal.productType, 'CRYPTO_SPOT');
+  assert.equal(outcome.signal.quoteCurrency, 'USDT');
+  assert.ok(outcome.signal.issues.some((i) => i.code === 'MERCADO_DECLARADO_DIVERGE'));
+  assert.equal(outcome.signal.status, 'VALID');
+});
+
+test('parser de texto livre reconhece instrumento de cripto e o mercado dele', () => {
+  const draft = parseFreeText('COMPRA BTCUSDT M15 entrada: 72500 SL: 71400 TP: 74300');
+  assert.equal(draft.symbol, 'BTCUSDT');
+  assert.equal(draft.marketId, 'CRYPTO');
+  assert.equal(draft.side, 'BUY');
+  assert.equal(draft.entryPrice, 72500);
+});
+
 test('parser de texto livre detecta contradicao e baixa a confianca', () => {
   const draft = parseFreeText('galera, pode comprar EURUSD mas quem quiser vender tambem serve');
   assert.equal(draft.side, null);
@@ -174,9 +237,11 @@ test('validacao e deterministica: mesma entrada, mesmo resultado', () => {
     raw: { text: 'x', externalMessageId: null },
     parsedBy: 'MANUAL',
     parserConfidence: null,
-    market: 'FX_SPOT',
+    marketId: 'FOREX',
+    productType: 'FX_SPOT',
     symbol: 'EURUSD',
     venue: 'REGULAR',
+    quoteCurrency: 'USD',
     broker: null,
     side: 'BUY',
     emittedAt: NOW,

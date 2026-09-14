@@ -1,17 +1,21 @@
 import { id } from './core/ids.ts';
 import type { Engine } from './engine/engine.ts';
+import type { MarketId } from './core/types.ts';
+import { MARKET_LABEL } from './core/types.ts';
 import type { SignalGenerator } from './sources/generator.ts';
 
 /**
  * Cenarios de demonstracao.
  *
- * Cada cenario exercita um caminho do fluxo completo e deixa o rastro no historico
- * de decisoes. Todos operam sobre a conta SIMULADA.
+ * Cada cenario exercita um caminho do fluxo e deixa o rastro no historico de
+ * decisoes, carimbado com o mercado. Todos operam sobre contas SIMULADAS.
  */
 
 export interface ScenarioDefinition {
   key: string;
   name: string;
+  /** Mercado destacado pelo cenario. `null` = cobre os dois. */
+  marketId: MarketId | null;
   description: string;
   expected: string;
   run: (engine: Engine, generator: SignalGenerator) => Promise<void> | void;
@@ -19,33 +23,51 @@ export interface ScenarioDefinition {
 
 /**
  * Alguns cenarios precisam enviar ordem. Se o momento atual estiver fora dos dias
- * ou horarios permitidos (fim de semana, por exemplo), o portao de horario bloqueia
- * o envio e o cenario nao demonstra nada.
+ * ou horarios permitidos do mercado (fim de semana em Forex, por exemplo), o
+ * portao de horario bloqueia o envio e o cenario nao demonstra nada.
  *
- * Aqui a janela e aberta de forma EXPLICITA: a alteracao vira evento de auditoria,
- * para que nenhuma configuracao do usuario mude em silencio.
+ * A janela e aberta de forma EXPLICITA: a alteracao vira evento de auditoria, para
+ * que nenhuma configuracao do usuario mude em silencio.
  */
-function openTradingWindowForDemo(engine: Engine): void {
-  const before = {
-    tradingDays: engine.riskSettings.tradingDays,
-    tradingWindows: engine.riskSettings.tradingWindows,
-  };
+function openTradingWindowForDemo(engine: Engine, marketId: MarketId): void {
+  const risk = engine.markets[marketId].risk;
   const allDays = [1, 2, 3, 4, 5, 6, 7];
-  const fullDay = [{ start: '00:00', end: '23:59' }];
   const needsChange =
-    before.tradingDays.length !== allDays.length ||
-    before.tradingWindows[0]?.start !== '00:00' ||
-    before.tradingWindows[0]?.end !== '23:59';
+    risk.tradingDays.length !== allDays.length ||
+    risk.tradingWindows[0]?.start !== '00:00' ||
+    risk.tradingWindows[0]?.end !== '23:59';
   if (!needsChange) return;
 
-  engine.riskSettings = { ...engine.riskSettings, tradingDays: allDays, tradingWindows: fullDay };
+  const before = { days: [...risk.tradingDays], windows: risk.tradingWindows.map((w) => ({ ...w })) };
+  engine.markets[marketId].risk = {
+    ...risk,
+    tradingDays: allDays,
+    tradingWindows: [{ start: '00:00', end: '23:59' }],
+  };
   engine.log(
     'SETTINGS_CHANGED',
     'WARN',
-    'Cenario abriu dias e horarios permitidos',
-    `Para demonstrar o envio de ordem, os dias permitidos passaram de [${before.tradingDays.join(', ')}] para todos e a janela para 00:00-23:59. ` +
-      'Restaure os valores sugeridos na tela Configuracoes antes de qualquer uso serio: forex spot nao negocia no fim de semana.',
+    marketId,
+    `Cenario abriu dias e horarios de ${MARKET_LABEL[marketId]}`,
+    `Para demonstrar o envio de ordem, os dias permitidos passaram de [${before.days.join(', ')}] para todos e a janela para 00:00-23:59. ` +
+      'Restaure os valores sugeridos na tela Configuracoes antes de qualquer uso serio.',
   );
+}
+
+/** Prepara um mercado para executar: conta ligada, automacao ligada, dia limpo. */
+async function armMarket(engine: Engine, marketId: MarketId): Promise<void> {
+  await engine.connectAll();
+  openTradingWindowForDemo(engine, marketId);
+  const day = engine.markets[marketId].day;
+  day.realizedNetPnl = 0;
+  day.dailyLimitHit = null;
+  day.pausedUntil = null;
+  day.consecutiveLosses = 0;
+  day.lastEntryAt = null;
+  engine.globalDay.realizedNetPnl = 0;
+  engine.globalDay.dailyLimitHit = null;
+  engine.setAutomationEnabled(marketId, true);
+  engine.setMode(marketId, 'AUTO');
 }
 
 function clearRecentSignals(engine: Engine, symbol: string): void {
@@ -60,17 +82,21 @@ function clearRecentSignals(engine: Engine, symbol: string): void {
   }
 }
 
+const FOREX_TRIO = ['src_alfa', 'src_beta', 'src_gama'];
+const CRYPTO_TRIO = ['src_satoshi', 'src_altseason', 'src_onchain'];
+
 export const scenarios: ScenarioDefinition[] = [
+  // --- Forex ----------------------------------------------------------------
   {
-    key: 'convergencia_suficiente',
-    name: 'Concordancia suficiente',
+    key: 'convergencia_forex',
+    name: 'Forex: concordancia suficiente',
+    marketId: 'FOREX',
     description:
-      'Tres grupos de independencia concordam com compra em EURUSD, um discorda. Espelho da Alfa envia o mesmo sinal e nao gera voto extra.',
-    expected:
-      'Publica oportunidade com 3 de 4 fontes participantes (75%). O espelho aparece como nao participante, com o motivo.',
+      'Tres grupos de Forex concordam com compra em EURUSD, um discorda. O espelho da Alfa envia o mesmo sinal e nao gera voto extra.',
+    expected: '3 de 4 fontes participantes de Forex (75%). Cripto nao entra no calculo.',
     run: (engine, generator) => {
       clearRecentSignals(engine, 'EURUSD');
-      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY', entryOffsetPips: 0 });
+      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY' });
       generator.emit({ sourceId: 'src_alfa_vip', symbol: 'EURUSD', side: 'BUY', entryOffsetPips: 0.5 });
       generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY', entryOffsetPips: 1.5 });
       generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY', entryOffsetPips: -2 });
@@ -79,10 +105,10 @@ export const scenarios: ScenarioDefinition[] = [
   },
   {
     key: 'sinais_contrarios',
-    name: 'Sinais contrarios derrubam a convergencia',
+    name: 'Forex: sinais contrarios derrubam a convergencia',
+    marketId: 'FOREX',
     description: 'Dois grupos compram GBPUSD e dois vendem, no mesmo instrumento e janela.',
-    expected:
-      'Concordancia de 50%, abaixo do minimo de 75%. Nenhuma oportunidade publicada; a tela Convergencias mostra o motivo.',
+    expected: 'Concordancia de 50%, abaixo do minimo. Nenhuma oportunidade publicada.',
     run: (engine, generator) => {
       clearRecentSignals(engine, 'GBPUSD');
       generator.emit({ sourceId: 'src_alfa', symbol: 'GBPUSD', side: 'BUY' });
@@ -93,18 +119,16 @@ export const scenarios: ScenarioDefinition[] = [
   },
   {
     key: 'expiracao',
-    name: 'Sinal expirado nao vota',
-    description:
-      'Tres fontes concordam em AUDUSD, porem dois sinais chegaram ha mais tempo que a idade maxima configurada.',
+    name: 'Forex: sinal expirado nao vota',
+    marketId: 'FOREX',
+    description: 'Tres fontes concordam em AUDUSD, porem dois sinais passaram da idade maxima.',
     expected: 'Sinais marcados como expirados. A contagem cai e a oportunidade nao e publicada.',
     run: (engine, generator) => {
       clearRecentSignals(engine, 'AUDUSD');
       const a = generator.emit({ sourceId: 'src_alfa', symbol: 'AUDUSD', side: 'BUY' });
       const b = generator.emit({ sourceId: 'src_beta', symbol: 'AUDUSD', side: 'BUY' });
       generator.emit({ sourceId: 'src_gama', symbol: 'AUDUSD', side: 'BUY' });
-
-      // Envelhece artificialmente dois sinais para alem da idade maxima.
-      const ageMinutes = engine.convergenceSettings.maxSignalAgeMinutes + 5;
+      const ageMinutes = engine.markets.FOREX.convergence.maxSignalAgeMinutes + 5;
       const past = new Date(Date.parse(engine.clock.nowIso()) - ageMinutes * 60_000).toISOString();
       for (const signalId of [a.signalId, b.signalId]) {
         const signal = engine.signals.find((s) => s.id === signalId);
@@ -118,16 +142,19 @@ export const scenarios: ScenarioDefinition[] = [
   },
   {
     key: 'duplicacao',
-    name: 'Mensagem duplicada',
+    name: 'Forex: mensagem duplicada',
+    marketId: 'FOREX',
     description: 'A mesma mensagem da Sala Alfa chega duas vezes em USDJPY.',
-    expected:
-      'A segunda entrega e reconhecida como duplicata pelo identificador de mensagem. Nenhum voto novo, registro no historico.',
+    expected: 'A segunda entrega e reconhecida pelo identificador. Nenhum voto novo.',
     run: (engine) => {
       clearRecentSignals(engine, 'USDJPY');
       const messageId = id('msg');
       const payload = {
         sourceId: 'src_alfa',
-        raw: { text: 'COMPRA USDJPY M15 entrada: 155.200 SL: 155.000 TP: 155.500', externalMessageId: messageId },
+        raw: {
+          text: 'COMPRA USDJPY M15 entrada: 155.200 SL: 155.000 TP: 155.500',
+          externalMessageId: messageId,
+        },
         parsedBy: 'GENERATOR' as const,
         symbol: 'USDJPY',
         venue: 'REGULAR' as const,
@@ -146,11 +173,10 @@ export const scenarios: ScenarioDefinition[] = [
   },
   {
     key: 'edicao_mensagem',
-    name: 'Mensagem editada pela fonte',
-    description:
-      'A Sala Alfa publica compra em USDCHF e em seguida edita a mesma mensagem invertendo a direcao para venda.',
-    expected:
-      'O sinal original vira versao substituida e para de votar. Somente a versao 2 permanece vigente.',
+    name: 'Forex: mensagem editada pela fonte',
+    marketId: 'FOREX',
+    description: 'A Sala Alfa publica compra em USDCHF e edita a mesma mensagem invertendo para venda.',
+    expected: 'O sinal original vira versao substituida. Somente a versao 2 vota.',
     run: (engine) => {
       clearRecentSignals(engine, 'USDCHF');
       const messageId = id('msg');
@@ -169,10 +195,7 @@ export const scenarios: ScenarioDefinition[] = [
       });
       engine.ingestSignal({
         sourceId: 'src_alfa',
-        raw: {
-          text: 'CORRECAO: VENDA USDCHF M15 entrada: 0.88900',
-          externalMessageId: messageId,
-        },
+        raw: { text: 'CORRECAO: VENDA USDCHF M15 entrada: 0.88900', externalMessageId: messageId },
         parsedBy: 'GENERATOR',
         action: 'EDIT',
         symbol: 'USDCHF',
@@ -187,65 +210,11 @@ export const scenarios: ScenarioDefinition[] = [
     },
   },
   {
-    key: 'cancelamento',
-    name: 'Cancelamento pela fonte',
-    description: 'A Mesa Beta envia um sinal e depois cancela a mesma mensagem.',
-    expected: 'O voto sai do agrupamento imediatamente e o cancelamento fica registrado.',
-    run: (engine) => {
-      const messageId = id('msg');
-      engine.ingestSignal({
-        sourceId: 'src_beta',
-        raw: { text: 'VENDA EURUSD M15 entrada: 1.08500', externalMessageId: messageId },
-        parsedBy: 'GENERATOR',
-        symbol: 'EURUSD',
-        venue: 'REGULAR',
-        side: 'SELL',
-        emittedAt: engine.clock.nowIso(),
-        timeframeMinutes: 15,
-        horizonMinutes: 60,
-        entryType: 'LIMIT',
-        entryPrice: 1.085,
-      });
-      engine.ingestSignal({
-        sourceId: 'src_beta',
-        raw: { text: 'CANCELADO', externalMessageId: messageId },
-        parsedBy: 'GENERATOR',
-        action: 'CANCEL',
-      });
-    },
-  },
-  {
-    key: 'mensagem_ambigua',
-    name: 'Mensagem ambigua nao vira operacao',
-    description:
-      'Texto livre contendo termos de compra e de venda ao mesmo tempo, interpretado com confianca baixa.',
-    expected: 'Sinal marcado como ambiguo pela validacao determinista. Nao vota e nao gera ordem.',
-    run: (engine) => {
-      engine.ingestSignal({
-        sourceId: 'src_webhook',
-        raw: {
-          text: 'pessoal, quem comprou EURUSD segura; quem quiser pode vender na maxima tambem',
-          externalMessageId: id('msg'),
-        },
-        parsedBy: 'AI_ASSISTED',
-        parserConfidence: 0.42,
-        symbol: 'EURUSD',
-        venue: 'REGULAR',
-        side: 'BUY',
-        emittedAt: engine.clock.nowIso(),
-        timeframeMinutes: 15,
-        horizonMinutes: 60,
-        entryType: 'MARKET',
-      });
-    },
-  },
-  {
     key: 'otc_nao_mistura',
-    name: 'OTC nao entra no mesmo agrupamento',
-    description:
-      'Duas fontes indicam compra em EURUSD regular e duas indicam compra em EURUSD-OTC.',
-    expected:
-      'Dois agrupamentos separados, cada um com 2 participantes. Nenhum atinge o minimo de 3 fontes.',
+    name: 'Forex: OTC nao entra no mesmo agrupamento',
+    marketId: 'FOREX',
+    description: 'Duas fontes indicam compra em EURUSD regular e duas em EURUSD-OTC.',
+    expected: 'Dois agrupamentos separados, 2 participantes cada. Nenhum atinge o minimo de 3.',
     run: (engine, generator) => {
       clearRecentSignals(engine, 'EURUSD');
       clearRecentSignals(engine, 'EURUSD-OTC');
@@ -255,109 +224,246 @@ export const scenarios: ScenarioDefinition[] = [
       generator.emit({ sourceId: 'src_delta', symbol: 'EURUSD-OTC', side: 'BUY' });
     },
   },
+
+  // --- Cripto ---------------------------------------------------------------
   {
-    key: 'horizonte_incompativel',
-    name: 'Horizonte incompativel',
-    description:
-      'Tres fontes compram EURUSD em M5 e a Delta Pro compra o mesmo par com horizonte de varios dias.',
-    expected:
-      'O voto da Delta entra em "nao comparaveis" com o motivo. O denominador nao e inflado por ele.',
+    key: 'convergencia_cripto',
+    name: 'Cripto: concordancia suficiente',
+    marketId: 'CRYPTO',
+    description: 'Tres salas de cripto concordam com compra em BTCUSDT a vista.',
+    expected: 'Oportunidade de Cripto publicada. Forex nao participa nem e afetado.',
     run: (engine, generator) => {
-      clearRecentSignals(engine, 'EURUSD');
-      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY', timeframeMinutes: 5, horizonMinutes: 20 });
-      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY', timeframeMinutes: 5, horizonMinutes: 25 });
-      generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY', timeframeMinutes: 5, horizonMinutes: 20 });
-      generator.emit({
-        sourceId: 'src_delta',
-        symbol: 'EURUSD',
-        side: 'BUY',
-        timeframeMinutes: 240,
-        horizonMinutes: 2880,
-      });
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of CRYPTO_TRIO) {
+        generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY', entryOffsetPips: (Math.random() - 0.5) * 10 });
+      }
     },
   },
   {
-    key: 'stop_diario',
-    name: 'Stop loss diario atingido',
+    key: 'spot_vs_perp',
+    name: 'Cripto: a vista e perpetuo nao convergem juntos',
+    marketId: 'CRYPTO',
     description:
-      'Forca o resultado realizado do dia abaixo do limite configurado e tenta publicar uma convergencia elegivel.',
-    expected: 'Oportunidade publicada, porem bloqueada pelo portao de stop diario, com o motivo no historico.',
+      'Duas salas compram BTCUSDT a vista e duas compram BTCUSDT-PERP, no mesmo par e na mesma janela.',
+    expected:
+      'Dois agrupamentos separados por tipo de produto, com 2 participantes cada. Nenhum atinge o minimo de 3.',
     run: (engine, generator) => {
-      const base = engine.day.baseEquity || engine.broker.getAccount().equity;
-      engine.day.realizedNetPnl =
-        -(base * engine.riskSettings.dailyLossLimitPercent) / 100 - 1;
-      engine.log(
-        'DAILY_LIMIT_HIT',
-        'BLOCK',
-        'Stop loss diario atingido (cenario)',
-        `Resultado realizado do dia forcado para ${engine.day.realizedNetPnl.toFixed(2)} a fim de demonstrar o bloqueio.`,
-      );
+      clearRecentSignals(engine, 'BTCUSDT');
+      clearRecentSignals(engine, 'BTCUSDT-PERP');
+      generator.emit({ sourceId: 'src_satoshi', symbol: 'BTCUSDT', side: 'BUY' });
+      generator.emit({ sourceId: 'src_altseason', symbol: 'BTCUSDT', side: 'BUY', entryOffsetPips: 2 });
+      generator.emit({ sourceId: 'src_perpdesk', symbol: 'BTCUSDT-PERP', side: 'BUY' });
+      generator.emit({ sourceId: 'src_whale', symbol: 'BTCUSDT-PERP', side: 'BUY', entryOffsetPips: 2 });
+    },
+  },
+  {
+    key: 'mercado_nao_cadastrado',
+    name: 'Cripto: sinal de mercado fora do cadastro da fonte',
+    marketId: null,
+    description: 'A Sala Alfa, cadastrada so para Forex, envia um sinal de BTCUSDT.',
+    expected:
+      'Sinal marcado como mercado nao cadastrado. Fica registrado e visivel, porem fora da convergencia dos dois mercados.',
+    run: (engine, generator) => {
+      generator.emit({ sourceId: 'src_alfa', symbol: 'BTCUSDT', side: 'BUY' });
+    },
+  },
+  {
+    key: 'cripto_nao_afeta_forex',
+    name: 'Isolamento: Cripto nao muda a concordancia de Forex',
+    marketId: null,
+    description:
+      'Primeiro gera dois votos de compra em EURUSD (insuficiente). Depois enche o mercado de Cripto com seis votos concordantes.',
+    expected:
+      'A avaliacao de Forex continua com 2 participantes e segue abaixo do corte. Cripto publica a sua propria oportunidade.',
+    run: (engine, generator) => {
       clearRecentSignals(engine, 'EURUSD');
+      clearRecentSignals(engine, 'ETHUSDT');
       generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY' });
+      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY', entryOffsetPips: 1 });
+      for (const sourceId of [...CRYPTO_TRIO, 'src_cryptoscalp', 'src_whale', 'src_global']) {
+        generator.emit({ sourceId, symbol: 'ETHUSDT', side: 'BUY', entryOffsetPips: (Math.random() - 0.5) * 8 });
+      }
       engine.runPipeline();
     },
   },
   {
-    key: 'falha_conexao',
-    name: 'Falha de conexao com a corretora',
-    description: 'Derruba a conexao e tenta executar uma convergencia elegivel.',
+    key: 'base_percentual',
+    name: 'Base do percentual: habilitadas x com sinal',
+    marketId: 'CRYPTO',
+    description:
+      'Tres salas de cripto concordam. Alterna a base do percentual entre "fontes habilitadas" e "sinais comparaveis" para mostrar a diferenca no denominador.',
     expected:
-      'Cotacoes param de atualizar. Os portoes de conexao e de idade da cotacao bloqueiam qualquer envio.',
+      'Com "sinais comparaveis" o denominador e 3 (100%). Com "fontes habilitadas" o denominador vira o total de grupos do mercado, e o silencio pesa contra.',
+    run: (engine, generator) => {
+      clearRecentSignals(engine, 'SOLUSDT');
+      for (const sourceId of CRYPTO_TRIO) {
+        generator.emit({ sourceId, symbol: 'SOLUSDT', side: 'BUY', entryOffsetPips: (Math.random() - 0.5) * 6 });
+      }
+      engine.updateConvergenceSettings('CRYPTO', { denominatorMode: 'ENABLED_SOURCES' });
+      engine.runPipeline();
+    },
+  },
+
+  // --- Automacao e limites --------------------------------------------------
+  {
+    key: 'automacao_independente',
+    name: 'Automacao independente por mercado',
+    marketId: null,
+    description:
+      'Liga a automacao de Cripto, desliga a de Forex e publica convergencia elegivel nos dois.',
+    expected:
+      'Cripto envia ordem. Forex publica a oportunidade e a bloqueia com o motivo "automacao desligada", mantendo sinais e posicoes.',
+    run: async (engine, generator) => {
+      await engine.connectAll();
+      openTradingWindowForDemo(engine, 'FOREX');
+      engine.setMode('FOREX', 'AUTO');
+      engine.setMode('CRYPTO', 'AUTO');
+      engine.setAutomationEnabled('FOREX', false);
+      engine.setAutomationEnabled('CRYPTO', true);
+      engine.markets.CRYPTO.day.lastEntryAt = null;
+      clearRecentSignals(engine, 'EURUSD');
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      for (const sourceId of CRYPTO_TRIO) generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+    },
+  },
+  {
+    key: 'execucao_simultanea',
+    name: 'Execucao simultanea nos dois mercados',
+    marketId: null,
+    description:
+      'Automacao ligada nos dois, convergencia elegivel em EURUSD e em BTCUSDT na mesma passagem do pipeline.',
+    expected:
+      'Duas ordens simuladas, uma por mercado, cada uma com sua conta e sua reserva de margem. Nenhuma reusa o saldo da outra.',
+    run: async (engine, generator) => {
+      await armMarket(engine, 'FOREX');
+      await armMarket(engine, 'CRYPTO');
+      engine.updateGlobalRiskSettings({ maxOpenPositionsTotal: 2 });
+      clearRecentSignals(engine, 'EURUSD');
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      for (const sourceId of CRYPTO_TRIO) generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+    },
+  },
+  {
+    key: 'limite_global',
+    name: 'Limite global bloqueia os dois mercados',
+    marketId: null,
+    description:
+      'Reduz o maximo global de posicoes para 1, abre uma posicao em Forex e tenta abrir outra em Cripto.',
+    expected:
+      'A segunda entrada e bloqueada pelo portao global, com o motivo marcado como GLOBAL, mesmo com o limite individual de Cripto livre.',
+    run: async (engine, generator) => {
+      await armMarket(engine, 'FOREX');
+      await armMarket(engine, 'CRYPTO');
+      engine.updateGlobalRiskSettings({ enabled: true, maxOpenPositionsTotal: 1 });
+      clearRecentSignals(engine, 'EURUSD');
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+      for (const sourceId of CRYPTO_TRIO) generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+    },
+  },
+  {
+    key: 'stop_diario_mercado',
+    name: 'Stop diario de um mercado nao para o outro',
+    marketId: null,
+    description:
+      'Forca o resultado realizado de Forex abaixo do limite diario e publica convergencia elegivel nos dois mercados.',
+    expected:
+      'Forex bloqueado pelo stop diario do mercado. Cripto continua elegivel: o limite individual so vale no mercado dele.',
+    run: async (engine, generator) => {
+      await armMarket(engine, 'FOREX');
+      await armMarket(engine, 'CRYPTO');
+      const base = engine.markets.FOREX.day.baseEquity || 10_000;
+      engine.markets.FOREX.day.realizedNetPnl =
+        -(base * engine.markets.FOREX.risk.dailyLossLimitPercent) / 100 - 1;
+      engine.log(
+        'DAILY_LIMIT_HIT',
+        'BLOCK',
+        'FOREX',
+        'Stop loss diario de Forex atingido (cenario)',
+        `Resultado realizado de Forex forcado para ${engine.markets.FOREX.day.realizedNetPnl.toFixed(2)} a fim de demonstrar o bloqueio por mercado.`,
+      );
+      clearRecentSignals(engine, 'EURUSD');
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      for (const sourceId of CRYPTO_TRIO) generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+    },
+  },
+  {
+    key: 'falha_conexao',
+    name: 'Falha de conexao na conta',
+    marketId: null,
+    description: 'Derruba a conta compartilhada e tenta executar convergencias elegiveis.',
+    expected:
+      'Cotacoes param de atualizar. Os portoes de conexao e de idade da cotacao bloqueiam qualquer envio nos mercados que usam essa conta.',
     run: async (engine, generator) => {
       clearRecentSignals(engine, 'EURUSD');
-      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY' });
-      await engine.setConnected(false);
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      await engine.setConnected('paper', false);
     },
   },
   {
     key: 'timeout_reconciliacao',
     name: 'Timeout de ordem e reconciliacao',
+    marketId: 'FOREX',
     description:
-      'Coloca a corretora simulada em modo de timeout, envia uma ordem e forca a reconciliacao pela chave de cliente.',
+      'Coloca a conta em modo de timeout, envia uma ordem de Forex e forca a reconciliacao pela chave de cliente.',
     expected:
       'A ordem expira sem resposta, o sistema consulta o estado pela chave e confirma a execucao sem enviar ordem duplicada.',
     run: async (engine, generator) => {
-      await engine.setConnected(true);
-      openTradingWindowForDemo(engine);
-      engine.setMode('AUTO');
-      engine.broker.failureMode = 'TIMEOUT';
+      await armMarket(engine, 'FOREX');
+      engine.brokerFor('FOREX').failureMode = 'TIMEOUT';
       clearRecentSignals(engine, 'EURUSD');
-      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY' });
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
       engine.runPipeline();
       await engine.flush();
-      engine.broker.failureMode = 'NONE';
+      engine.brokerFor('FOREX').failureMode = 'NONE';
     },
   },
   {
-    key: 'execucao_completa',
-    name: 'Fluxo completo ate a execucao',
+    key: 'execucao_completa_cripto',
+    name: 'Cripto: fluxo completo ate a execucao',
+    marketId: 'CRYPTO',
     description:
-      'Modo autonomo, conexao ativa, tres fontes concordantes em EURUSD. Depois empurra o preco ate o alvo.',
+      'Automacao de Cripto ligada, tres salas concordantes em BTCUSDT. Depois empurra o preco ate o alvo.',
     expected:
-      'Publica, aprova no risco, envia ordem, abre posicao simulada e encerra no take profit, registrando o resultado.',
+      'Publica, aprova no risco, envia ordem, abre posicao simulada e encerra no take profit, registrando o resultado em Cripto.',
     run: async (engine, generator) => {
-      await engine.setConnected(true);
-      openTradingWindowForDemo(engine);
-      engine.day.realizedNetPnl = 0;
-      engine.day.dailyLimitHit = null;
-      engine.day.pausedUntil = null;
-      engine.day.consecutiveLosses = 0;
-      engine.setMode('AUTO');
-      clearRecentSignals(engine, 'EURUSD');
-      generator.emit({ sourceId: 'src_alfa', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_beta', symbol: 'EURUSD', side: 'BUY' });
-      generator.emit({ sourceId: 'src_gama', symbol: 'EURUSD', side: 'BUY' });
+      await armMarket(engine, 'CRYPTO');
+      clearRecentSignals(engine, 'BTCUSDT');
+      for (const sourceId of CRYPTO_TRIO) generator.emit({ sourceId, symbol: 'BTCUSDT', side: 'BUY' });
       engine.runPipeline();
-      // Espera o envio concluir antes de mexer no preco: caso contrario a ordem
-      // seria preenchida ja com o preco deslocado e o alvo ficaria para tras.
       await engine.flush();
-      engine.broker.nudge('EURUSD', 35);
+      engine.brokerFor('CRYPTO').nudge('BTCUSDT', 300);
+      engine.runPipeline();
+      await engine.flush();
+    },
+  },
+  {
+    key: 'execucao_completa_forex',
+    name: 'Forex: fluxo completo ate a execucao',
+    marketId: 'FOREX',
+    description:
+      'Automacao de Forex ligada, tres salas concordantes em EURUSD. Depois empurra o preco ate o alvo.',
+    expected: 'Publica, aprova, envia, abre posicao simulada e encerra no take profit.',
+    run: async (engine, generator) => {
+      await armMarket(engine, 'FOREX');
+      clearRecentSignals(engine, 'EURUSD');
+      for (const sourceId of FOREX_TRIO) generator.emit({ sourceId, symbol: 'EURUSD', side: 'BUY' });
+      engine.runPipeline();
+      await engine.flush();
+      engine.brokerFor('FOREX').nudge('EURUSD', 35);
       engine.runPipeline();
       await engine.flush();
     },

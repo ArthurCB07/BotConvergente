@@ -1,32 +1,28 @@
-import type { AccountSnapshot, Position, Quote, Side } from '../core/types.ts';
+import type { AccountSnapshot, MarketId, Position, Quote, Side } from '../core/types.ts';
 
 /**
- * Contrato unico de corretora.
+ * Contrato unico de conexao, valido para corretora de forex e para exchange de
+ * cripto. Toda integracao real futura implementa esta interface; a camada de
+ * execucao nao conhece nenhum detalhe de protocolo.
  *
- * Toda integracao real futura (MetaTrader 5, cTrader, API propria de corretora)
- * implementa esta interface. A camada de execucao nao conhece nenhum detalhe de
- * protocolo. Credenciais ficam sempre no backend e nunca sao devolvidas por
- * `describe()` nem escritas em log.
+ * Uma conexao declara QUAIS mercados e quais instrumentos atende. O motor de risco
+ * bloqueia o envio quando o instrumento nao e suportado: conexao de forex nao
+ * opera cripto por presuncao.
+ *
+ * Credenciais ficam sempre no backend e nunca sao devolvidas por `describe()` nem
+ * escritas em log.
  */
 
 export type BrokerStatus = 'CONNECTED' | 'DISCONNECTED' | 'NOT_IMPLEMENTED' | 'ERROR';
 
 export interface BrokerCapabilities {
-  /** Consulta de saldo, patrimonio e margem. */
   account: boolean;
-  /** Consulta de posicoes abertas. */
   positions: boolean;
-  /** Envio de ordem a mercado. */
   marketOrders: boolean;
-  /** Stop loss e take profit anexados a ordem. */
   attachedStops: boolean;
-  /** Cancelamento de ordens pendentes. */
   cancelOrders: boolean;
-  /** Reconciliacao por identificador de cliente. */
   clientOrderIdLookup: boolean;
-  /** Ambiente de demonstracao oficial. */
   demoEnvironment: boolean;
-  /** Exige terminal ou servico intermediario rodando. */
   requiresLocalTerminal: boolean;
 }
 
@@ -34,8 +30,10 @@ export interface BrokerDescriptor {
   id: string;
   name: string;
   status: BrokerStatus;
-  /** Mercados cobertos pelo adaptador. */
-  markets: string[];
+  /** Mercados de topo atendidos. */
+  markets: MarketId[];
+  /** Classes de produto atendidas. */
+  products: string[];
   capabilities: BrokerCapabilities;
   authentication: string;
   /** O que falta para habilitar a integracao. Vazio quando implementada. */
@@ -43,13 +41,14 @@ export interface BrokerDescriptor {
   restrictions: string[];
   docsUrl: string;
   accountType: AccountSnapshot['accountType'];
+  currency: string;
 }
 
 export interface PlaceOrderRequest {
   clientOrderId: string;
   symbol: string;
   side: Side;
-  lots: number;
+  quantity: number;
   stopLoss: number | null;
   takeProfit: number | null;
   maxDeviationPips: number;
@@ -62,12 +61,22 @@ export type PlaceOrderResult =
   | { status: 'DUPLICATE'; brokerOrderId: string; filledPrice: number; positionId: string };
 
 export interface BrokerAdapter {
+  readonly id: string;
   describe(): BrokerDescriptor;
+  /** A conexao negocia este instrumento? */
+  supportsSymbol(symbol: string): boolean;
   isConnected(): boolean;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getAccount(): AccountSnapshot;
   getQuote(symbol: string): Quote | null;
+  /**
+   * Reserva margem de forma sincrona, antes de qualquer `await`. Devolve `false`
+   * quando nao ha recurso livre. Sem isso, duas ordens simultaneas de mercados
+   * diferentes na MESMA conta poderiam comprometer o mesmo saldo duas vezes.
+   */
+  reserveMargin(key: string, amount: number): boolean;
+  releaseMargin(key: string): void;
   placeOrder(req: PlaceOrderRequest): Promise<PlaceOrderResult>;
   /**
    * Reconciliacao: consulta o estado de uma ordem pelo identificador de cliente.

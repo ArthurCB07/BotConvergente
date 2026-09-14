@@ -1,5 +1,6 @@
+import { PRODUCT_LABEL, type MarketId } from '../api.ts';
 import { Quorum } from './Quorum.tsx';
-import { Badge, Checks, SIDE_LABEL, countdown, money, pct } from './ui.tsx';
+import { Badge, Checks, MarketChip, SIDE_LABEL, countdown, money, pct } from './ui.tsx';
 
 const STATUS: Record<string, { tone: 'ok' | 'block' | 'watch' | 'risk' | 'neutral'; label: string }> = {
   PUBLISHED: { tone: 'watch', label: 'Publicada' },
@@ -16,6 +17,7 @@ export function OpportunityCard({
   decision,
   now,
   mode,
+  currency,
   awaiting,
   onConfirm,
   onReject,
@@ -25,6 +27,7 @@ export function OpportunityCard({
   decision: any;
   now: string;
   mode: string;
+  currency: string;
   awaiting: boolean;
   onConfirm: () => void;
   onReject: () => void;
@@ -34,14 +37,17 @@ export function OpportunityCard({
   const blocks = decision?.blocks ?? [];
   const allowed = decision?.allowed === true;
   const sizing = decision?.sizing;
+  const marketId = opportunity.marketId as MarketId;
 
   return (
     <article className="opp">
       <header className="opp-head">
+        <MarketChip marketId={marketId} />
         <span className="opp-symbol">{opportunity.symbol}</span>
         <Badge tone={opportunity.side === 'BUY' ? 'long' : 'short'}>
           {SIDE_LABEL[opportunity.side]}
         </Badge>
+        <Badge tone="neutral">{PRODUCT_LABEL[opportunity.productType] ?? opportunity.productType}</Badge>
         <Badge tone={status.tone}>{status.label}</Badge>
         {opportunity.venue === 'OTC' && <Badge tone="risk">OTC</Badge>}
         <span className="tiny dim num">v{opportunity.version}</span>
@@ -55,8 +61,8 @@ export function OpportunityCard({
           <div>
             <div className="eyebrow">Concordancia</div>
             <div className="figure">{pct(opportunity.agreementPercent, 0)}</div>
-            <div className="tiny dim">
-              {opportunity.agreeingCount} de {opportunity.participantCount} fontes participantes
+            <div className="tiny dim num">
+              {opportunity.agreeingCount} / {opportunity.participantCount}
             </div>
           </div>
           <div>
@@ -69,15 +75,19 @@ export function OpportunityCard({
           {sizing && (
             <div>
               <div className="eyebrow">Dimensionamento</div>
-              <div className="figure-sm">{sizing.lots} lote(s)</div>
+              <div className="figure-sm">
+                {sizing.quantity} {sizing.quantityLabel}
+              </div>
               <div className="tiny dim">
-                Ordem {money(sizing.notionalValue)} · Arriscado {money(sizing.riskedValue)}
+                Ordem {money(sizing.notionalValue, currency)} · Arriscado{' '}
+                {money(sizing.riskedValue, currency)}
               </div>
             </div>
           )}
         </div>
 
         <p className="small muted">{opportunity.summary}</p>
+        <p className="tiny dim">{opportunity.denominatorRule}</p>
 
         <Quorum
           agreeing={opportunity.agreeing}
@@ -118,7 +128,7 @@ export function OpportunityCard({
       <footer className="opp-foot">
         {mode === 'OBSERVE' && (
           <span className="small muted">
-            Modo Observacao: nenhuma ordem sai daqui. Troque o modo para operar.
+            Modo Observacao: nenhuma ordem sai daqui. Troque o modo deste mercado para operar.
           </span>
         )}
         {mode !== 'OBSERVE' && opportunity.status !== 'EXECUTED' && (
@@ -126,8 +136,8 @@ export function OpportunityCard({
             <button
               className="btn btn-primary btn-sm"
               onClick={onConfirm}
-              disabled={busy || !allowed}
-              title={allowed ? 'Enviar ordem na conta simulada' : blocks.map((b: any) => b.label).join('; ')}
+              disabled={busy}
+              title="Enviar ordem na conta simulada deste mercado"
             >
               {mode === 'AUTO' ? 'Enviar agora' : 'Confirmar e enviar'}
             </button>
@@ -138,8 +148,13 @@ export function OpportunityCard({
           </>
         )}
         {!allowed && blocks.length > 0 && (
-          <span className="small" style={{ color: 'var(--block)' }}>
-            {blocks.map((b: any) => b.label).join(' · ')}
+          <span className="row small" style={{ gap: 6 }}>
+            {blocks.map((b: any) => (
+              <Badge key={b.code} tone={b.scope === 'GLOBAL' ? 'risk' : 'block'}>
+                {b.scope === 'GLOBAL' ? 'global · ' : ''}
+                {b.label}
+              </Badge>
+            ))}
           </span>
         )}
       </footer>
